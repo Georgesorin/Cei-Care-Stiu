@@ -81,6 +81,43 @@ BOMB_CAR_DAMAGE = 2
 BOMB_START_COUNT = 1
 BOMB_ROUND_GROWTH = 1
 
+# Lobby difficulty buttons and presets
+LOBBY_BUTTONS = {
+    'E': {
+        'label': 'E',
+        'x_range': (5, 11),
+        'y_range': (4, 8),
+        'bg': lambda p: (0, int(140 * p), int(55 * p)),
+        'border': lambda p: (0, int(70 * p), int(25 * p)),
+        'text': (180, 255, 200),
+        'difficulty': 'EASY',
+    },
+    'N': {
+        'label': 'N',
+        'x_range': (5, 11),
+        'y_range': (13, 18),
+        'bg': lambda p: (0, int(60 * p), int(200 * p)),
+        'border': lambda p: (0, int(30 * p), int(100 * p)),
+        'text': (180, 215, 255),
+        'difficulty': 'NORMAL',
+    },
+    'H': {
+        'label': 'H',
+        'x_range': (5, 11),
+        'y_range': (23, 27),
+        'bg': lambda p: (int(185 * p), int(20 * p), 0),
+        'border': lambda p: (int(92 * p), int(10 * p), 0),
+        'text': (255, 160, 90),
+        'difficulty': 'HARD',
+    },
+}
+
+DIFFICULTY_PRESETS = {
+    'EASY': {'num_players': 3, 'mins': 1, 'rounds': 3, 'fall_speed': 0.55},
+    'NORMAL': {'num_players': 5, 'mins': 2, 'rounds': 5, 'fall_speed': 0.40},
+    'HARD': {'num_players': 8, 'mins': 3, 'rounds': 7, 'fall_speed': 0.26},
+}
+
 # Tetris Shapes
 SHAPES = {
     'O': [(0, 0)],  # Damage cubes are 1x1
@@ -126,7 +163,8 @@ FONT = {
     'W': [(0, 0), (0, 1), (0, 2), (0, 3), (0, 4), (4, 0), (4, 1), (4, 2), (4, 3), (4, 4), (1, 3), (2, 2), (3, 3)],
     # Wide W
     'I': [(0, 0), (1, 0), (2, 0), (1, 1), (1, 2), (1, 3), (0, 4), (1, 4), (2, 4)],
-    'N': [(0, 0), (0, 1), (0, 2), (0, 3), (0, 4), (3, 0), (3, 1), (3, 2), (3, 3), (3, 4), (1, 1), (2, 2)]  # Compact N
+    'N': [(0, 0), (0, 1), (0, 2), (0, 3), (0, 4), (3, 0), (3, 1), (3, 2), (3, 3), (3, 4), (1, 1), (2, 2)],  # Compact N
+    'H': [(0, 0), (2, 0), (0, 1), (2, 1), (0, 2), (1, 2), (2, 2), (0, 3), (2, 3), (0, 4), (2, 4)],  # H
 }
 
 # Input Configuration
@@ -249,6 +287,9 @@ class SoundManager:
         self.hit_sound = None
         self.ambient_sound = None
         self.ambient_channel = None
+        self.deflect_sound = None
+        self.attack_sound = None
+        self.bomb_deflect_sound = None
 
         if not PYGAME_AVAILABLE:
             return
@@ -333,6 +374,30 @@ class SoundManager:
             else:
                 print("Audio note: loss not found; loss sound disabled.")
 
+            self.deflect_sound = None
+            deflect_path = _load_sfx("deflect")
+            if deflect_path:
+                self.deflect_sound = pygame.mixer.Sound(deflect_path)
+                self.deflect_sound.set_volume(0.25)  # Slightly quieter as it can be frequent
+            else:
+                print("Audio note: deflect not found; deflect sound disabled.")
+
+            self.attack_sound = None
+            attack_path = _load_sfx("attack")
+            if attack_path:
+                self.attack_sound = pygame.mixer.Sound(attack_path)
+                self.attack_sound.set_volume(0.25)
+            else:
+                print("Audio note: attack not found; attack sound disabled.")
+
+            self.bomb_deflect_sound = None
+            bomb_deflect_path = _load_sfx("bomb_deflect")
+            if bomb_deflect_path:
+                self.bomb_deflect_sound = pygame.mixer.Sound(bomb_deflect_path)
+                self.bomb_deflect_sound.set_volume(0.28)
+            else:
+                print("Audio note: bomb_deflect not found; bomb deflect sound disabled.")
+
             self.enabled = True
         except Exception as exc:
             print(f"Audio init failed: {exc}")
@@ -397,6 +462,30 @@ class SoundManager:
             return
         try:
             self.loss_sound.play()
+        except Exception:
+            pass
+
+    def play_deflect(self):
+        if not self.enabled or not self.deflect_sound:
+            return
+        try:
+            self.deflect_sound.play()
+        except Exception:
+            pass
+
+    def play_attack(self):
+        if not self.enabled or not self.attack_sound:
+            return
+        try:
+            self.attack_sound.play()
+        except Exception:
+            pass
+
+    def play_bomb_deflect(self):
+        if not self.enabled or not self.bomb_deflect_sound:
+            return
+        try:
+            self.bomb_deflect_sound.play()
         except Exception:
             pass
 
@@ -575,6 +664,8 @@ class PresidentGame:
         p.respawn_time = time.time() + self.respawn_delay
         print(f"Player {p.id} bullet destroyed by {reason}.")
 
+        self.sound.play_deflect()
+
     def _apply_global_damage(self, amount, reason):
         if PresidentialVehicle.global_points <= 0:
             return
@@ -599,6 +690,7 @@ class PresidentGame:
 
         if getattr(p.piece, 'click_hits_remaining', 1) > 1:
             p.piece.click_hits_remaining -= 1
+            self.sound.play_attack()
             print(
                 f"Player {p.id} rare bullet damaged by {reason}. "
                 f"{p.piece.click_hits_remaining} click left."
@@ -673,12 +765,14 @@ class PresidentGame:
     def _apply_bomb_click_damage(self, bomb, reason):
         bomb['hits_remaining'] -= 1
         if bomb['hits_remaining'] > 0:
+            self.sound.play_attack()
             print(
                 f"Bomb at ({bomb['x']},{bomb['y']}) damaged by {reason}. "
                 f"{bomb['hits_remaining']} steps left."
             )
             return False
 
+        self.sound.play_bomb_deflect()
         print(f"Bomb at ({bomb['x']},{bomb['y']}) destroyed by {reason}.")
         self.bombs = [b for b in self.bombs if b is not bomb]
         return True
@@ -1202,7 +1296,8 @@ class PresidentGame:
         obstacle_cells = self._obstacle_cells()
         edge_props = self._edge_prop_cells()
         for cell_x, cell_y in self._big_cube_cells(center_x, center_y):
-            if cell_x < 0 or cell_x >= BOARD_WIDTH or cell_y < 0 or cell_y >= BOARD_HEIGHT:
+            # Prevent big cube from entering reserved rows 0-1 (health bar and timer)
+            if cell_x < 0 or cell_x >= BOARD_WIDTH or cell_y < 2 or cell_y >= BOARD_HEIGHT:
                 return False
             if (cell_x, cell_y) in edge_props:
                 # Cops/banks are decorative only, never blocking.
@@ -1216,8 +1311,8 @@ class PresidentGame:
         edge_props = self._edge_prop_cells()
         for bx, by in blocks:
             nx, ny = bx + dx, by + dy
-            # Wall collision
-            if nx < 0 or nx >= BOARD_WIDTH or ny >= BOARD_HEIGHT or ny < 0:
+            # Wall collision (including reserved rows 0-1 for health bar and timer)
+            if nx < 0 or nx >= BOARD_WIDTH or ny >= BOARD_HEIGHT or ny < 2:
                 return True
 
             # Decorative edge props (banks/cops) should never collide.
@@ -1244,6 +1339,11 @@ class PresidentGame:
     def tick(self):
         with self.lock:
             if self.state == 'LOBBY':
+                while self.board_touch_queue:
+                    x, y = self.board_touch_queue.popleft()
+                    self._lobby_handle_click(x, y)
+                    if self.state != 'LOBBY':
+                        break  # game was just started
                 return
 
             if self.state == 'GAMEOVER':
@@ -1528,6 +1628,23 @@ class PresidentGame:
 
         return False
 
+    def _lobby_handle_click(self, x, y):
+        """Handle a board tap in LOBBY to select difficulty and start game."""
+        for btn_key, btn_def in LOBBY_BUTTONS.items():
+            x_min, x_max = btn_def['x_range']
+            y_min, y_max = btn_def['y_range']
+            if x_min <= x <= x_max and y_min <= y <= y_max:
+                difficulty_key = btn_def['difficulty']
+                diff = DIFFICULTY_PRESETS[difficulty_key]
+                print(f"[Lobby] {btn_key} button selected: {difficulty_key}")
+                self.round_duration_minutes = diff['mins']
+                self.round_number = 1
+                self.total_rounds_to_survive = diff['rounds']
+                self.base_fall_speed = diff['fall_speed']
+                self.current_fall_speed = self.base_fall_speed
+                self.start_game(diff['num_players'])
+                return
+
     def process_board_touch_queue(self):
         while self.board_touch_queue:
             x, y = self.board_touch_queue.popleft()
@@ -1647,6 +1764,33 @@ class PresidentGame:
                         b = min(255, b + 50)
 
                     self.set_led(buffer, x, y, (r, g, b))
+
+            # --- Render lobby difficulty buttons ---
+            pulse = 0.72 + 0.28 * math.sin(t * 3.5)
+            for btn_key, btn_def in LOBBY_BUTTONS.items():
+                x_min, x_max = btn_def['x_range']
+                y_min, y_max = btn_def['y_range']
+                bg_color = btn_def['bg'](pulse)
+                border_color = btn_def['border'](pulse)
+                text_color = btn_def['text']
+                
+                # Fill button area
+                for bx in range(x_min, x_max + 1):
+                    for by in range(y_min, y_max + 1):
+                        self.set_led(buffer, bx, by, bg_color)
+                
+                # Draw border (1-pixel frame)
+                for bx in range(x_min, x_max + 1):
+                    self.set_led(buffer, bx, y_min, border_color)
+                    self.set_led(buffer, bx, y_max, border_color)
+                for by in range(y_min, y_max + 1):
+                    self.set_led(buffer, x_min, by, border_color)
+                    self.set_led(buffer, x_max, by, border_color)
+                
+                # Draw centered rotated letter
+                letter_x = x_min + 1
+                letter_y = y_min + 1
+                self.draw_text_rotated_right(buffer, btn_key, letter_x, letter_y, text_color)
 
             return buffer
 
@@ -2121,7 +2265,7 @@ class PresidentGame:
         attempts = 0
         while attempts < 100:
             x = random.randint(0, BOARD_WIDTH-1)
-            y = random.randint(0, BOARD_HEIGHT-1)
+            y = random.randint(2, BOARD_HEIGHT-1)  # Avoid reserved rows 0-1
             # Check if (x, y) is not in any obstacle
             is_safe = True
             for ox, oy in self.current_obstacle_map:
@@ -2143,8 +2287,8 @@ class PresidentGame:
             if is_safe:
                 return x, y
             attempts += 1
-        # fallback: just return (0,0)
-        return 0, 0
+        # fallback: return safe position avoiding rows 0-1
+        return 0, 2
 
     def _find_safe_edge_spawn(self):
         corners = list(self._edge_loop_corner_points())
@@ -2187,7 +2331,8 @@ class PresidentGame:
                 if self._is_edge_lane_center(x, y) and self._can_place_big_cube(x, y):
                     return x, y
 
-        return 1, 0
+        # Fallback: spawn at a safe position avoiding reserved rows 0-1
+        return 1, 2
 
 
 class NetworkManager:
