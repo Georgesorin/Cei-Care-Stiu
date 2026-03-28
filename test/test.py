@@ -16,6 +16,31 @@ from math import gcd
 
 import json
 
+def _ensure_packages_installed():
+    """Auto-install numpy, scipy, and pygame if missing."""
+    packages = {
+        "numpy": "numpy",
+        "scipy": "scipy",
+        "pygame": "pygame",
+    }
+    for import_name, pip_name in packages.items():
+        if importlib.util.find_spec(import_name) is None:
+            print(f"[SETUP] {pip_name} missing. Auto-installing...", flush=True)
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-m", "pip", "install",
+                     "--disable-pip-version-check", "--no-input", "--quiet", pip_name],
+                    capture_output=True, text=True, timeout=120
+                )
+                if result.returncode == 0:
+                    print(f"[SETUP] {pip_name} installed.", flush=True)
+                else:
+                    print(f"[SETUP] {pip_name} install failed (code {result.returncode})", flush=True)
+            except Exception as e:
+                print(f"[SETUP] {pip_name} install exception: {e}", flush=True)
+
+_ensure_packages_installed()
+
 try:
     import numpy as np
     NUMPY_AVAILABLE = True
