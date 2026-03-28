@@ -98,6 +98,22 @@ try:
 except ImportError:
     WINSOUND_AVAILABLE = False
 
+# Import note mutation helper from mutate_midi (octave-shifts out-of-range notes)
+try:
+    _mutate_midi_dir = os.path.dirname(os.path.abspath(__file__))
+    if _mutate_midi_dir not in sys.path:
+        sys.path.insert(0, _mutate_midi_dir)
+    from mutate_midi import mutate_note as _mutate_midi_note
+except Exception:
+    # Fallback: same octave-shift logic inline
+    def _mutate_midi_note(note: int) -> int:
+        PIANO_LOW, PIANO_HIGH = 48, 79
+        while note < PIANO_LOW:
+            note += 12
+        while note > PIANO_HIGH:
+            note -= 12
+        return max(PIANO_LOW, min(PIANO_HIGH, note))
+
 # --- Sample-based Piano (uses real piano samples) ---
 SEMITONE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 FLAT_TO_SHARP = {
@@ -736,17 +752,24 @@ class MidiSongPlayer:
     MOVE_SPEED = 1
     MOVE_STEP_FRAMES = 2  # Move every N render frames to slow travel
     LINGER_SECONDS = 0.20 # Keep note visible briefly at piano roll
-    TEMPO_SCALE = 2.0     # 2x time => half BPM
+    HARD_TEMPO_SCALE = 2.0     # 2x time => half BPM
     LEAD_TICKS = 13  # ~0.65s at 20 FPS (render loop is 50 ms)
     MAX_SPAWNS_PER_FRAME = 6  # Queue budget to avoid bursty visual updates
 
     SHARP_POSITIONS = {1, 3, 6, 8, 10}
-    COLOR_NATURAL = (0, 200, 220)    # cyan
-    COLOR_SHARP   = (255, 130, 0)    # orange
+    # Right-side colors (going right)
+    COLOR_NATURAL_RIGHT = (0, 200, 220)    # cyan
+    COLOR_SHARP_RIGHT   = (255, 130, 0)    # orange
+    # Left-side colors (going left)
+    COLOR_NATURAL_LEFT  = (180, 0, 255)    # purple
+    COLOR_SHARP_LEFT    = (0, 230, 80)     # green
+    DIRECTION_INTERVAL  = 7.0   # seconds between direction changes
 
-    def __init__(self, midi_path, piano_controller):
+    def __init__(self, midi_path, piano_controller, difficulty='medium'):
         self.piano = piano_controller
         self.midi_path = midi_path
+        self.difficulty = difficulty  # 'easy', 'medium', 'hard'
+        self.tempo_scale = self.HARD_TEMPO_SCALE if difficulty == 'hard' else 1.0
         self.all_notes = []      # immutable source notes for replay
         self.flying_notes = []   # active on-screen note blocks
         self.pending_notes = []  # notes waiting to be spawned, sorted by spawn_time
@@ -768,6 +791,8 @@ class MidiSongPlayer:
         self.song_started = False
         self._current_elapsed = 0.0
         self._update_counter = 0
+        self._going_right = True          # current travel direction
+        self._next_interval_at = self.DIRECTION_INTERVAL  # elapsed time of next change
 
     def _load_midi(self, path):
         try:
@@ -799,20 +824,24 @@ class MidiSongPlayer:
                 events.append((abs_time, msg.note))
 
         parsed_notes = []
+        note_index = 0  # For hard mode: alternate sides per note
         for play_time, midi_note in events:
-            scaled_play_time = play_time * self.TEMPO_SCALE
-            # Piano roll base is C3 (MIDI 48)
-            note_idx = max(0, min(BOARD_HEIGHT - 1, midi_note - 48))
+            scaled_play_time = play_time * self.tempo_scale
+            # Shift out-of-range notes into piano range (C3–G5, MIDI 48–79) by octave
+            midi_note = _mutate_midi_note(midi_note)
+            note_idx = midi_note - 48  # guaranteed in [0, BOARD_HEIGHT-1]
             row = (BOARD_HEIGHT - 1) - note_idx
-            is_sharp = (note_idx % 12) in self.SHARP_POSITIONS
-            color = self.COLOR_SHARP if is_sharp else self.COLOR_NATURAL
-            parsed_notes.append({
+            note_dict = {
                 'spawn_time': max(0.0, scaled_play_time - lead_time),
                 'play_time':  scaled_play_time,
                 'note_idx':   note_idx,
                 'row':        row,
-                'color':      color,
-            })
+            }
+            # For hard mode, force alternating sides
+            if self.difficulty == 'hard':
+                note_dict['forced_side'] = 'left' if note_index % 2 == 0 else 'right'
+                note_index += 1
+            parsed_notes.append(note_dict)
 
         parsed_notes.sort(key=lambda n: n['spawn_time'])
         self.all_notes = parsed_notes
@@ -828,7 +857,9 @@ class MidiSongPlayer:
                 print(f"MIDI reload error: {e}", flush=True)
 
         self._reset_song_state()
-        self.start_time = time.time()
+        # Subtract START_DELAY so elapsed is negative for the first second,
+        # meaning no notes will spawn until 1s after the piano roll appears.
+        self.start_time = time.time() + 1.0
         self.song_started = True
 
     def update(self):
@@ -846,18 +877,42 @@ class MidiSongPlayer:
             self.spawn_queue.append(self.pending_notes.pop(0))
             queued_this_frame += 1
 
+        # Check 10-second interval: toggle direction.
+        if elapsed >= self._next_interval_at:
+            self._going_right = not self._going_right
+            self._next_interval_at += self.DIRECTION_INTERVAL
+
         # Release only a limited number from queue each frame.
         budget = self.MAX_SPAWNS_PER_FRAME
         while budget > 0 and self.spawn_queue:
             n = self.spawn_queue.pop(0)
             spawned_this_frame += 1
             budget -= 1
-            # Right-side indicator only
+            # Use forced_side if present (hard mode), otherwise current direction
+            going_right = n.get('forced_side', 'right' if self._going_right else 'left') == 'right'
+            # Pick side, direction, and color set
+            if going_right:
+                spawn_x   = self.MIDDLE_COL_RIGHT
+                target_x  = self.TARGET_COL_RIGHT
+                dx        = self.MOVE_SPEED
+                color_natural = self.COLOR_NATURAL_RIGHT
+                color_sharp   = self.COLOR_SHARP_RIGHT
+            else:
+                spawn_x   = self.MIDDLE_COL_LEFT
+                target_x  = self.TARGET_COL_LEFT
+                dx        = -self.MOVE_SPEED
+                color_natural = self.COLOR_NATURAL_LEFT
+                color_sharp   = self.COLOR_SHARP_LEFT
+            is_sharp = (n['note_idx'] % 12) in self.SHARP_POSITIONS
+            note_color = color_sharp if is_sharp else color_natural
+            # Mirror row vertically for left-going notes
+            row = n['row'] if going_right else (BOARD_HEIGHT - 1 - n['note_idx'])
             self.flying_notes.append({
-                'row': n['row'], 'x': self.MIDDLE_COL_RIGHT,
-                'color': n['color'],
+                'row': row, 'x': spawn_x,
+                'color': note_color,
+                'note_idx': n['note_idx'],
                 'spawn_time': n['spawn_time'], 'play_time': n['play_time'],
-                'phase': 'fade', 'target_x': self.TARGET_COL_RIGHT, 'dx': self.MOVE_SPEED,
+                'phase': 'fade', 'target_x': target_x, 'dx': dx,
             })
 
         self._current_elapsed = elapsed
@@ -897,6 +952,19 @@ class MidiSongPlayer:
         if not self.pending_notes and not self.spawn_queue and not self.flying_notes:
             self.finished = True
 
+    def check_piano_hit(self, side: str, note_idx: int) -> bool:
+        """
+        Returns True if there is a linger-phase note at the given side's piano
+        column matching note_idx.  Consumes the note (removes it) so it only
+        scores once per press.
+        """
+        target_x = self.TARGET_COL_RIGHT if side == 'right' else self.TARGET_COL_LEFT
+        for i, n in enumerate(self.flying_notes):
+            if n['phase'] == 'linger' and n['x'] == target_x and n['note_idx'] == note_idx:
+                self.flying_notes.pop(i)
+                return True
+        return False
+
     def get_flying_notes(self):
         """Return two-phase guide notes: fade at center, then move outward."""
         result = []
@@ -921,6 +989,7 @@ class Player:
     def __init__(self):
         self.points = 0
         self.player_scores = {}
+        self.side_scores = {'left': 0, 'right': 0}  # piano-guide hit scores per side
         self.control_rows = [1, 2, 3, 4, 5]  # Control pad rows for groups 0-4
         self.control_column = 1  # Control pads are at column 1
         self.last_scored_states = {}  # Track which flashes we've already scored
@@ -981,9 +1050,16 @@ class TestGame:
         self.board = [[BLACK for _ in range(BOARD_WIDTH)] for _ in range(BOARD_HEIGHT)]
 
         self.running = True
-        self.state = 'LOBBY' # LOBBY, STARTUP, PLAYING, GAMEOVER
+        self.state = 'LOBBY' # LOBBY, SIDE_SELECT, COUNTDOWN, PLAYING, GAMEOVER
         self.startup_step = 0
         self.startup_timer = time.time()
+        self.countdown_start_time = None
+        self.winner_side = None  # 'left' or 'right'
+        self.game_over_start_time = None
+        self.GAMEOVER_DURATION = 5.0
+        self.countdown_sound_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "countdown.wav")
+        self.COUNTDOWN_STEP = 1.5
+        self.COUNTDOWN_DURATION = self.COUNTDOWN_STEP * 3
 
         self.lock = threading.RLock()
         
@@ -996,69 +1072,34 @@ class TestGame:
         
         # Initialize piano controller for button-to-note mapping
         self.piano = PianoController()
-
-        # Load MIDI song — first song.mid, then any .mid file in the test folder
         self.midi_player = None
-        test_dir = os.path.dirname(os.path.abspath(__file__))
-        midi_path = os.path.join(test_dir, "song.mid")
-        if not os.path.exists(midi_path):
-            mid_files = [f for f in os.listdir(test_dir) if f.lower().endswith('.mid')]
-            if mid_files:
-                midi_path = os.path.join(test_dir, mid_files[0])
-            else:
-                midi_path = None
-        if midi_path and os.path.exists(midi_path):
-            try:
-                self.midi_player = MidiSongPlayer(midi_path, self.piano)
-            except Exception as e:
-                print(f"Failed to load MIDI song: {e}", flush=True)
-        else:
-            pass
 
-    def _build_player_button_map(self, row_groups_left, row_groups_right, left_edge, right_edge):
-        """Build 10-player button map from row-group bands.
+        # Lobby voting state
+        self.lobby_start_time = time.time()
+        self.LOBBY_DURATION = 12.0  # seconds
+        # Zone row boundaries (board is 32 rows tall)
+        # easy: rows 0-9, medium: rows 10-20, hard: rows 21-31
+        self.LOBBY_ZONES = [
+            ('easy',   0,  9,  (0, 220, 60)),
+            ('medium', 10, 20, (220, 200, 0)),
+            ('hard',   21, 31, (220, 30, 0)),
+        ]
 
-        Player ownership model:
-        - P1: left, first element of each lane tuple
-        - P2: right, first element of each lane tuple
-        - P3: left, second element ... and so on.
-        """
-        player_map = {}
-        lanes_per_side = len(row_groups_left)
-        bands = len(row_groups_left[0]) if row_groups_left else 0
-
-        for band_index in range(bands):
-            left_player_id = (band_index * 2) + 1
-            right_player_id = left_player_id + 1
-
-            left_buttons = []
-            right_buttons = []
-
-            for lane_index in range(lanes_per_side):
-                left_row = row_groups_left[lane_index][band_index]
-                right_row = row_groups_right[lane_index][band_index]
-
-                left_buttons.append(self.player.get_led_index(left_edge, left_row))
-                right_buttons.append(self.player.get_led_index(right_edge, right_row))
-
-            player_map[left_player_id] = left_buttons
-            player_map[right_player_id] = right_buttons
-
-        self.player_button_map = player_map
-
-    def reset_board(self):
-        self.board = [[BLACK for _ in range(BOARD_WIDTH)] for _ in range(BOARD_HEIGHT)]
+        # Side-select state
+        self.side_select_start_time = None
+        self.SIDE_SELECT_DURATION = 2.0  # seconds
 
     def set_led(self, buffer, x, y, color):
-        if x < 0 or x >= 16:
+        if x < 0 or x >= BOARD_WIDTH:
+            return
+        if y < 0 or y >= BOARD_HEIGHT:
             return
 
         channel = y // 4
-        if channel >= 8:
+        if channel >= NUM_CHANNELS:
             return
 
         row_in_channel = y % 4
-
         if row_in_channel % 2 == 0:
             led_index = row_in_channel * 16 + x
         else:
@@ -1066,17 +1107,285 @@ class TestGame:
 
         block_size = NUM_CHANNELS * 3
         offset = led_index * block_size + channel
-
         if offset + NUM_CHANNELS * 2 < len(buffer):
-            buffer[offset] = color[1]  # GREEN (Swap for hardware)
-            buffer[offset + NUM_CHANNELS] = color[0]  # RED (Swap for hardware)
-            buffer[offset + NUM_CHANNELS*2] = color[2]
+            buffer[offset] = color[1]
+            buffer[offset + NUM_CHANNELS] = color[0]
+            buffer[offset + NUM_CHANNELS * 2] = color[2]
+
+    def reset_board(self):
+        self.board = [[BLACK for _ in range(BOARD_WIDTH)] for _ in range(BOARD_HEIGHT)]
+        self.player_button_map = {}
+
+    def _build_player_button_map(self, row_groups_left, row_groups_right, left_edge, right_edge):
+        player_map = {}
+
+        for group_index, rows in enumerate(row_groups_left):
+            buttons = []
+            for y in rows:
+                if 0 <= y < BOARD_HEIGHT:
+                    buttons.append(self.player.get_led_index(left_edge, y))
+            player_map[group_index] = buttons
+
+        base_index = len(row_groups_left)
+        for local_index, rows in enumerate(row_groups_right):
+            buttons = []
+            for y in rows:
+                if 0 <= y < BOARD_HEIGHT:
+                    buttons.append(self.player.get_led_index(right_edge, y))
+            player_map[base_index + local_index] = buttons
+
+        self.player_button_map = player_map
+
+    def _render_countdown(self, frame_buffer):
+        """3-2-1 countdown: renders large pixel-art digits centred on the board."""
+        # 3-wide x 5-tall bitmaps for each digit
+        GLYPHS = {
+            3: [
+                [1,1,1],
+                [0,0,1],
+                [1,1,1],
+                [0,0,1],
+                [1,1,1],
+            ],
+            2: [
+                [1,1,1],
+                [0,0,1],
+                [1,1,1],
+                [1,0,0],
+                [1,1,1],
+            ],
+            1: [
+                [0,1,0],
+                [1,1,0],
+                [0,1,0],
+                [0,1,0],
+                [1,1,1],
+            ],
+        }
+        SCALE = 4  # each glyph pixel -> 4x4 LEDs => 12 wide x 20 tall on board
+
+        elapsed    = time.time() - self.countdown_start_time
+        digit      = max(1, 3 - int(elapsed / self.COUNTDOWN_STEP))
+        frac       = (elapsed % self.COUNTDOWN_STEP) / self.COUNTDOWN_STEP
+        colors     = {3: (0, 220, 60), 2: (220, 200, 0), 1: (220, 30, 0)}
+        base_color = colors[digit]
+        # Brief flash at the start of each digit transition
+        brightness = 1.5 if frac < 0.08 else 1.0
+        draw_color = tuple(min(255, int(c * brightness)) for c in base_color)
+        dim        = tuple(int(c * 0.10) for c in base_color)
+
+        glyph  = GLYPHS[digit]
+        gh     = len(glyph) * SCALE       # 20
+        gw     = len(glyph[0]) * SCALE    # 12
+        off_y  = (BOARD_HEIGHT - gh) // 2
+        off_x  = (BOARD_WIDTH  - gw) // 2
+
+        # Background
+        for y in range(BOARD_HEIGHT):
+            for x in range(BOARD_WIDTH):
+                self.set_led(frame_buffer, x, y, dim)
+
+        # Draw glyph
+        for gy, row in enumerate(glyph):
+            for gx, bit in enumerate(row):
+                if bit:
+                    for dy in range(SCALE):
+                        for dx in range(SCALE):
+                            px = off_x + gx * SCALE + dx
+                            py = off_y + gy * SCALE + dy
+                            if 0 <= px < BOARD_WIDTH and 0 <= py < BOARD_HEIGHT:
+                                self.set_led(frame_buffer, px, py, draw_color)
+
+    def _play_countdown_sound(self):
+        if not os.path.exists(self.countdown_sound_path):
+            print(f"Countdown sound missing: {self.countdown_sound_path}", flush=True)
+            return
+
+        try:
+            if PYGAME_AVAILABLE and pygame.mixer.get_init():
+                sound = pygame.mixer.Sound(self.countdown_sound_path)
+                channel = pygame.mixer.find_channel(True)
+                if channel is not None:
+                    channel.play(sound)
+                    return
+                sound.play()
+                return
+        except Exception as e:
+            print(f"Countdown sound pygame failed: {e}", flush=True)
+
+        try:
+            if WINSOUND_AVAILABLE:
+                winsound.PlaySound(self.countdown_sound_path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+                return
+        except Exception as e:
+            print(f"Countdown sound winsound failed: {e}", flush=True)
+
+        try:
+            if os.name == 'nt':
+                os.startfile(self.countdown_sound_path)
+        except Exception as e:
+            print(f"Countdown sound fallback failed: {e}", flush=True)
+
+    def _render_side_select(self, frame_buffer):
+        """Show left half purple, right half cyan with a 5s countdown bar."""
+        elapsed    = time.time() - self.side_select_start_time
+        remaining  = max(0.0, self.SIDE_SELECT_DURATION - elapsed)
+        frac       = remaining / self.SIDE_SELECT_DURATION
+        pulse      = 0.55 + 0.45 * math.sin(self.time_counter * 0.18)
+
+        LEFT_COLOR  = (int(180 * pulse), 0, int(255 * pulse))   # purple
+        RIGHT_COLOR = (0, int(200 * pulse), int(220 * pulse))   # cyan
+        MID         = BOARD_WIDTH // 2  # col 8 is the split
+
+        for y in range(BOARD_HEIGHT):
+            for x in range(BOARD_WIDTH):
+                color = LEFT_COLOR if x < MID else RIGHT_COLOR
+                self.set_led(frame_buffer, x, y, color)
+
+        # White divider at centre
+        for y in range(BOARD_HEIGHT):
+            self.set_led(frame_buffer, MID - 1, y, WHITE)
+            self.set_led(frame_buffer, MID,     y, WHITE)
+
+        # Countdown bar at top row
+        for x in range(BOARD_WIDTH):
+            color = WHITE if x < int(frac * BOARD_WIDTH) else BLACK
+            self.set_led(frame_buffer, x, 0, color)
+
+
+
+
+
+
+
+
+    # ------------------------------------------------------------------ lobby
+    def _lobby_zone(self, button_idx):
+        """Return the difficulty zone name for a button index, or None."""
+        channel      = button_idx // 64
+        row_in_chan  = (button_idx % 64) // 16
+        y = channel * 4 + row_in_chan
+        for name, lo, hi, _ in self.LOBBY_ZONES:
+            if lo <= y <= hi:
+                return name
+        return None
+
+    def _load_midi_by_difficulty(self, difficulty):
+        """Load the MIDI file matching the chosen difficulty."""
+        test_dir  = os.path.dirname(os.path.abspath(__file__))
+        midi_path = os.path.join(test_dir, f"{difficulty}.mid")
+        if not os.path.exists(midi_path):
+            # Fallback: first .mid found
+            mid_files = sorted(f for f in os.listdir(test_dir) if f.lower().endswith('.mid'))
+            if not mid_files:
+                print("No MIDI file found!", flush=True)
+                return
+            midi_path = os.path.join(test_dir, mid_files[0])
+        try:
+            self.midi_player = MidiSongPlayer(midi_path, self.piano, difficulty=difficulty)
+            print(f"Lobby: loaded {os.path.basename(midi_path)} ({difficulty})", flush=True)
+        except Exception as e:
+            print(f"Failed to load MIDI: {e}", flush=True)
+
+    def _render_lobby(self, frame_buffer):
+        """Draw the 3 difficulty zones with live press indicators."""
+        pulse = 0.55 + 0.45 * math.sin(self.time_counter * 0.18)
+        elapsed        = time.time() - self.lobby_start_time
+        remaining      = max(0.0, self.LOBBY_DURATION - elapsed)
+        countdown_frac = remaining / self.LOBBY_DURATION
+
+        # Count currently held buttons per zone (live)
+        live_counts = {'easy': 0, 'medium': 0, 'hard': 0}
+        for btn_idx, state in enumerate(self.button_states):
+            if state:
+                zone = self._lobby_zone(btn_idx)
+                if zone:
+                    live_counts[zone] += 1
+
+        for name, lo, hi, base_color in self.LOBBY_ZONES:
+            votes = live_counts[name]
+            for y in range(lo, hi + 1):
+                for x in range(BOARD_WIDTH):
+                    br = 0.20 + 0.25 * pulse
+                    if x < votes:
+                        br = 0.85
+                    color = (int(base_color[0] * br),
+                             int(base_color[1] * br),
+                             int(base_color[2] * br))
+                    self.set_led(frame_buffer, x, y, color)
+
+        # Countdown bar at top row
+        for x in range(BOARD_WIDTH):
+            if x < int(countdown_frac * BOARD_WIDTH):
+                self.set_led(frame_buffer, x, 0, WHITE)
+            else:
+                self.set_led(frame_buffer, x, 0, BLACK)
+
+    def _render_gameover(self, frame_buffer):
+        """Fill the whole field with the winner color and tint the ground rows."""
+        team_colors = {
+            'left': (180, 0, 255),
+            'right': (0, 200, 220),
+        }
+        base_color = team_colors.get(self.winner_side, (100, 100, 100))
+        pulse = 0.75 + 0.25 * math.sin(self.time_counter * 0.10)
+
+        sky_color = tuple(int(channel * (0.55 * pulse)) for channel in base_color)
+        ground_color = tuple(min(255, int(channel * (1.00 * pulse))) for channel in base_color)
+        text_color = WHITE if sum(base_color) < 420 else BLACK
+
+        for y in range(BOARD_HEIGHT):
+            color = ground_color if y >= BOARD_HEIGHT - 6 else sky_color
+            for x in range(BOARD_WIDTH):
+                self.set_led(frame_buffer, x, y, color)
+
+        glyphs = {
+            'W': [
+                [1, 0, 0, 0, 1],
+                [1, 0, 0, 0, 1],
+                [1, 0, 1, 0, 1],
+                [1, 1, 0, 1, 1],
+                [1, 0, 0, 0, 1],
+            ],
+            'I': [
+                [1, 1, 1],
+                [0, 1, 0],
+                [0, 1, 0],
+                [0, 1, 0],
+                [1, 1, 1],
+            ],
+            'N': [
+                [1, 0, 0, 1],
+                [1, 1, 0, 1],
+                [1, 0, 1, 1],
+                [1, 0, 0, 1],
+                [1, 0, 0, 1],
+            ],
+        }
+
+        word = 'WIN'
+        spacing = 1
+        glyph_height = 5
+        total_width = sum(len(glyphs[ch][0]) for ch in word) + spacing * (len(word) - 1)
+        start_x = max(0, (BOARD_WIDTH - total_width) // 2)
+        start_y = max(1, (BOARD_HEIGHT - 6 - glyph_height) // 2)
+        cursor_x = start_x
+
+        for ch in word:
+            glyph = glyphs[ch]
+            for gy, row in enumerate(glyph):
+                for gx, bit in enumerate(row):
+                    if bit:
+                        self.set_led(frame_buffer, cursor_x + gx, start_y + gy, text_color)
+            cursor_x += len(glyph[0]) + spacing
 
     def start_game(self):
         with self.lock:
             self.reset_board()
-            self.state = 'STARTUP'
-            self.startup_step = 0
+            self.state = 'COUNTDOWN'
+            self.countdown_start_time = time.time()
+            self._play_countdown_sound()
+            print("3... 2... 1...", flush=True)
 
     def render(self):
         # Create a blank frame buffer
@@ -1084,6 +1393,30 @@ class TestGame:
 
         if not hasattr(self, 'time_counter'):
             self.time_counter = 0
+
+        if self.state == 'LOBBY':
+            self._render_lobby(frame_buffer)
+            self.time_counter += 1
+            self.prev_button_states = self.button_states.copy()
+            return frame_buffer
+
+        if self.state == 'SIDE_SELECT':
+            self._render_side_select(frame_buffer)
+            self.time_counter += 1
+            self.prev_button_states = self.button_states.copy()
+            return frame_buffer
+
+        if self.state == 'COUNTDOWN':
+            self._render_countdown(frame_buffer)
+            self.time_counter += 1
+            self.prev_button_states = self.button_states.copy()
+            return frame_buffer
+
+        if self.state == 'GAMEOVER':
+            self._render_gameover(frame_buffer)
+            self.time_counter += 1
+            self.prev_button_states = self.button_states.copy()
+            return frame_buffer
 
         # Fill background with dim dark blue.
         for y in range(BOARD_HEIGHT):
@@ -1173,20 +1506,38 @@ class TestGame:
     def tick(self):
         with self.lock:
             if self.state == 'LOBBY':
+                # Check if timer has expired — snapshot current button state
+                elapsed = time.time() - self.lobby_start_time
+                if elapsed >= self.LOBBY_DURATION:
+                    votes = {'easy': 0, 'medium': 0, 'hard': 0}
+                    for btn_idx, state in enumerate(self.button_states):
+                        if state:
+                            zone = self._lobby_zone(btn_idx)
+                            if zone:
+                                votes[zone] += 1
+                    # Pick difficulty with most votes; tie-break: easy > medium > hard
+                    winner = max(votes, key=lambda k: (votes[k], -['easy','medium','hard'].index(k)))
+                    print(f"Lobby result: {votes} → {winner}", flush=True)
+                    self._load_midi_by_difficulty(winner)
+                    self.state = 'SIDE_SELECT'
+                    self.side_select_start_time = time.time()
+                    print("Choose your side! (5 seconds)", flush=True)
                 return
 
-            if self.state == 'STARTUP':
-                now = time.time()
-                delay = 0.2 if self.startup_step < 5 else 1.0
-                if now - self.startup_timer > delay:
-                    self.startup_step += 1
-                    self.startup_timer = now
-                    if self.startup_step >= 10:
-                        print("FIGHT! Game Starting...")
-                        self.state = 'PLAYING'
-                        self.game_start_time = time.time()
-                        if self.midi_player:
-                            self.midi_player.start()
+            if self.state == 'SIDE_SELECT':
+                elapsed = time.time() - self.side_select_start_time
+                if elapsed >= self.SIDE_SELECT_DURATION:
+                    self.start_game()
+                return
+
+            if self.state == 'COUNTDOWN':
+                elapsed = time.time() - self.countdown_start_time
+                if elapsed >= self.COUNTDOWN_DURATION:
+                    print("FIGHT! Game Starting...", flush=True)
+                    self.state = 'PLAYING'
+                    self.game_start_time = time.time()
+                    if self.midi_player:
+                        self.midi_player.start()
                 return
 
             if self.state == 'PLAYING':
@@ -1198,11 +1549,36 @@ class TestGame:
                     import traceback
                     traceback.print_exc()
 
+                # Score points when a player presses a lit (linger) note on their side
+                if self.midi_player:
+                    prev = self.prev_button_states
+                    curr = self.button_states
+                    for btn_idx, note_idx in self.piano._button_to_note_index.items():
+                        if btn_idx < len(curr) and curr[btn_idx] and not (btn_idx < len(prev) and prev[btn_idx]):
+                            side = self.piano._button_side_map.get(btn_idx)
+                            if side and self.midi_player.check_piano_hit(side, note_idx):
+                                self.player.side_scores[side] = self.player.side_scores.get(side, 0) + 1
+                                self.player.points += 1
+                                left  = self.player.side_scores.get('left', 0)
+                                right = self.player.side_scores.get('right', 0)
+                                print(f"SCORE! {side.upper()} side hit note {note_idx} | Left: {left}  Right: {right}  Total: {self.player.points}")
+
+                    # Check if song finished
+                    if self.midi_player and self.midi_player.finished:
+                        left_score = self.player.side_scores.get('left', 0)
+                        right_score = self.player.side_scores.get('right', 0)
+                        self.winner_side = 'left' if left_score > right_score else 'right'
+                        self.state = 'GAMEOVER'
+                        self.game_over_start_time = time.time()
+                        print(f"GAME OVER! Winner: {self.winner_side.upper()} side ({left_score} vs {right_score})", flush=True)
+                    return
+
             if self.state == 'GAMEOVER':
-                now = time.time()
-                if now - self.game_over_timer > 0.5:
-                    self.game_over_timer = now
-                    self.winner_flash_count += 1
+                if self.game_over_start_time is None:
+                    self.game_over_start_time = time.time()
+                elif time.time() - self.game_over_start_time >= self.GAMEOVER_DURATION:
+                    print("Closing program after winner screen.", flush=True)
+                    self.running = False
                 return
 
 class NetworkManager:
@@ -1374,9 +1750,6 @@ class NetworkManager:
                                 new_states[dst_idx] = (data[source_idx] == 0xCC)
 
                     with self.game.lock:
-                        if self.game.state == 'LOBBY' and any(new_states):
-                            self.game.start_game()
-                        
                         self.game.button_states = new_states
                         self.prev_button_states = self.game.button_states.copy()
 
