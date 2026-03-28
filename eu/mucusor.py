@@ -53,7 +53,7 @@ FRAME_DATA_LENGTH = NUM_CHANNELS * LEDS_PER_CHANNEL * 3
 
 # Board Area: Channels 0-6 (Rows 0-27)
 BOARD_WIDTH = 16
-BOARD_HEIGHT = 28
+BOARD_HEIGHT = 32
 
 # Input Area: Channel 7 (Rows 28-31)
 INPUT_CHANNEL = 7
@@ -68,16 +68,11 @@ BLUE = (0, 0, 255)
 CYAN = (0, 255, 255)
 MAGENTA = (255, 0, 255)
 ORANGE = (255, 165, 0)
+GOLD = (255, 215, 0)
 
 # Tetris Shapes
 SHAPES = {
-    # 'I': [(-1, 0), (0, 0), (1, 0), (2, 0)],
-    'O': [(0, 0)],
-    # 'T': [(-1, 0), (0, 0), (1, 0), (0, 1)],
-    # 'S': [(0, 0), (1, 0), (-1, 1), (0, 1)],
-    # 'Z': [(-1, 0), (0, 0), (0, 1), (1, 1)],
-    # 'J': [(-1, 0), (0, 0), (1, 0), (1, 1)],
-    # 'L': [(-1, 0), (0, 0), (1, 0), (-1, 1)]
+    'O': [(0, 0)],  # Damage cubes are 1x1
 }
 
 SHAPE_COLORS = {
@@ -167,11 +162,20 @@ class Player:
     def spawn_piece(self):
         shape_key = self.next_shape_key
         self.next_shape_key = random.choice(list(SHAPES.keys()))
-        spawn_x = random.randint(0, BOARD_WIDTH - 1)
-        spawn_y = random.randint(0, BOARD_HEIGHT - 1)
+        # Use safe spawn
+        if hasattr(self, 'game') and hasattr(self.game, '_find_safe_spawn'):
+            spawn_x, spawn_y = self.game._find_safe_spawn()
+        else:
+            spawn_x = random.randint(0, BOARD_WIDTH - 1)
+            spawn_y = random.randint(0, BOARD_HEIGHT - 1)
         self.piece = PresidentialVehicle(shape_key, self.color, spawn_x, spawn_y)
 
 class PresidentGame:
+    def apply_color_scheme(self):
+        scheme = self.color_schemes[(self.round_number-1) % len(self.color_schemes)]
+        self.obstacle_color = scheme['obstacle']
+        # Optionally update other colors if needed
+
     def __init__(self):
         self.board = [[BLACK for _ in range(BOARD_WIDTH)] for _ in range(BOARD_HEIGHT)]
         self.players = []
@@ -199,6 +203,20 @@ class PresidentGame:
         self.winner_flash_count = 0
         self.game_over_timer = 0
 
+        # --- Obstacle maps (positions for tree-like obstacles, full grid) ---
+        self.obstacle_maps = [
+            # Map 1: scattered blocks (full grid, less aggressive)
+            [(random.randint(0, 15), random.randint(0, 31)) for _ in range(8)],
+            # Map 2: diagonal line (full grid)
+            [(i, i) for i in range(min(BOARD_WIDTH, BOARD_HEIGHT))],
+            # Map 3: border
+            [(x, 0) for x in range(BOARD_WIDTH)] + [(x, BOARD_HEIGHT-1) for x in range(BOARD_WIDTH)] + [(0, y) for y in range(BOARD_HEIGHT)] + [(BOARD_WIDTH-1, y) for y in range(BOARD_HEIGHT)],
+            # Map 4: random blocks (full grid, less aggressive)
+            [(random.randint(0, 15), random.randint(0, 31)) for _ in range(10)]
+        ]
+        self.obstacle_color = (64, 64, 64)  # dark gray
+        self.current_obstacle_map = []
+
         # Motion trail for smooth visuals
         self.trail = [[0.0 for _ in range(BOARD_WIDTH)] for _ in range(BOARD_HEIGHT)]
         self.trail_color = [[BLACK for _ in range(BOARD_WIDTH)] for _ in range(BOARD_HEIGHT)]
@@ -221,31 +239,61 @@ class PresidentGame:
         # Key: (player_id, action_str) -> Value: next_trigger_time
         self.input_timers = {}
 
+        # Big cube
+        self.big_cube = None
+        self.big_cube_speed = 1.0  # seconds per move
+        self.big_cube_last_move = time.time()
+        self.big_cube_direction = random.choice([(0,1),(0,-1),(1,0),(-1,0)])
+        self.big_cube_turn_interval = random.uniform(2,5)
+        self.big_cube_last_turn = time.time()
+
+        self.round_duration_minutes = 1  # default, will be set at start
+        self.round_start_time = None
+        self.round_number = 1
+        self.color_schemes = [
+            {'bg': (0,0,0), 'obstacle': (64,64,64), 'bullet': (255,215,0), 'car': (255,255,255)},
+            {'bg': (10,10,30), 'obstacle': (0,128,255), 'bullet': (255,140,0), 'car': (255,255,255)},
+            {'bg': (30,10,10), 'obstacle': (128,0,64), 'bullet': (0,255,255), 'car': (255,255,255)},
+            {'bg': (0,30,10), 'obstacle': (0,255,128), 'bullet': (255,0,255), 'car': (255,255,255)},
+        ]
+
     def setup_players(self, count):
         self.players = []
         if count < 1: count = 1
         # if count > 4: count = 4
 
-        colors = [RED, YELLOW, GREEN, BLUE]
-
+        # All bullets are gold
+        bullet_color = GOLD
         width = 16 // count
         for i in range(count):
             start = i * width
             end = start + width - 1
             if i == count - 1: end = 15
 
-            color_index = random.randint(0, len(colors) - 1)
-            p = Player(i, colors[color_index], start, end)
+            p = Player(i, bullet_color, start, end)
+            p.game = self  # Give player access to game for safe spawn
             self.players.append(p)
 
     def start_game(self, num_players):
         with self.lock:
             self.setup_players(num_players)
             self.reset_board()
+            # Choose random obstacle map
+            self.current_obstacle_map = random.choice(self.obstacle_maps)
+            for x, y in self.current_obstacle_map:
+                # + shape: center and 4 arms
+                plus_pixels = [(0,0), (0,-1), (0,1), (-1,0), (1,0)]
+                for dx, dy in plus_pixels:
+                    nx, ny = x + dx, y + dy
+                    if 0 <= nx < BOARD_WIDTH and 0 <= ny < BOARD_HEIGHT:
+                        self.board[ny][nx] = self.obstacle_color
+            # Spawn big car in safe spot
+            bx, by = self._find_safe_spawn()
+            self.big_cube = {'x': bx, 'y': by, 'color': WHITE}
             # self.sound.start_bgm()
-            self.state = 'STARTUP'
-            self.startup_step = 0
-            self.startup_timer = time.time()
+            self.state = 'COUNTDOWN'
+            self.countdown_start_time = time.time()
+            self.countdown_seconds = 3
             self.flashing_lines = []
 
     def restart_round(self):
@@ -260,6 +308,12 @@ class PresidentGame:
     def _spawn_next(self):
         if self.next_spawn_index < len(self.players):
             self.players[self.next_spawn_index].spawn_piece()
+            p = self.players[self.next_spawn_index]
+            if self.big_cube:
+                dx = self.big_cube['x'] - p.piece.x
+                dy = self.big_cube['y'] - p.piece.y
+                p.directionX = 1 if dx >= 0 else -1
+                p.directionY = 1 if dy >= 0 else -1
             self.next_spawn_index += 1
 
     def process_inputs(self):
@@ -296,6 +350,39 @@ class PresidentGame:
         reduction = (elapsed // 10) * 0.05
         self.current_fall_speed = max(self.min_fall_speed, self.base_fall_speed - reduction)
 
+    def _obstacle_cells(self):
+        cells = set()
+        for ox, oy in self.current_obstacle_map:
+            for dx, dy in [(0, 0), (0, -1), (0, 1), (-1, 0), (1, 0)]:
+                nx, ny = ox + dx, oy + dy
+                if 0 <= nx < BOARD_WIDTH and 0 <= ny < BOARD_HEIGHT:
+                    cells.add((nx, ny))
+        return cells
+
+    def _big_cube_cells(self, center_x=None, center_y=None):
+        if center_x is None or center_y is None:
+            if not self.big_cube:
+                return []
+            center_x = self.big_cube['x']
+            center_y = self.big_cube['y']
+        return [
+            (center_x - 1, center_y),
+            (center_x, center_y),
+            (center_x + 1, center_y),
+            (center_x - 1, center_y + 1),
+            (center_x, center_y + 1),
+            (center_x + 1, center_y + 1),
+        ]
+
+    def _can_place_big_cube(self, center_x, center_y):
+        obstacle_cells = self._obstacle_cells()
+        for cell_x, cell_y in self._big_cube_cells(center_x, center_y):
+            if cell_x < 0 or cell_x >= BOARD_WIDTH or cell_y < 0 or cell_y >= BOARD_HEIGHT:
+                return False
+            if (cell_x, cell_y) in obstacle_cells:
+                return False
+        return True
+
     def is_collision(self, piece, player=None, dx=0, dy=0, absolute_blocks=None):
         blocks = absolute_blocks if absolute_blocks else piece.get_absolute_blocks()
         for bx, by in blocks:
@@ -314,6 +401,11 @@ class PresidentGame:
                     for obx, oby in other.piece.get_absolute_blocks():
                         if nx == obx and ny == oby:
                             return True
+            # Big car collision
+            if self.big_cube:
+                for cx, cy in self._big_cube_cells():
+                    if nx == cx and ny == cy:
+                        return True
         return False
 
     def tick(self):
@@ -321,31 +413,39 @@ class PresidentGame:
             if self.state == 'LOBBY':
                 return
 
-            if self.state == 'STARTUP':
+            if self.state == 'COUNTDOWN':
                 now = time.time()
-                delay = 0.2 if self.startup_step < 5 else 1.0
-                if now - self.startup_timer > delay:
-                    self.startup_step += 1
-                    self.startup_timer = now
-                    if self.startup_step >= 10:
-                        print("FIGHT! Game Starting...")
-                        self.state = 'PLAYING'
-                        self.game_start_time = time.time()
-                        self.last_tick = time.time()
-                        # Spawn only the first cube; rest spawn sequentially
-                        self.next_spawn_index = 0
-                        self.last_spawn_time = time.time()
-                        self._spawn_next()
+                elapsed = int(now - self.countdown_start_time)
+                if elapsed >= self.countdown_seconds:
+                    print("FIGHT! Transition effect...")
+                    self.state = 'TRANSITION'
+                    self.transition_start_time = time.time()
+                    self.transition_duration = 1.5
                 return
 
-            if self.state == 'GAMEOVER':
+            if self.state == 'TRANSITION':
                 now = time.time()
-                if now - self.game_over_timer > 0.5:
-                    self.game_over_timer = now
-                    self.winner_flash_count += 1
+                elapsed = now - self.transition_start_time
+                # Add a small pause after the animation before PLAYING
+                total_transition = self.transition_duration + 0.7
+                if elapsed >= total_transition:
+                    self.state = 'PLAYING'
+                    self.game_start_time = time.time()
+                    self.last_tick = time.time()
+                    self.next_spawn_index = 0
+                    self.last_spawn_time = time.time()
+                    self._spawn_next()
                 return
 
             # --- PLAYING STATE ---
+            # Round timer logic must be here!
+            if self.round_start_time is not None and self.round_duration_minutes > 0:
+                elapsed = time.time() - self.round_start_time
+                if elapsed >= self.round_duration_minutes * 60:
+                    self.round_number += 1
+                    self.round_start_time = time.time()
+                    self.apply_color_scheme()
+                    print(f"--- ROUND {self.round_number} ---")
 
             # Sequential spawning
             if self.next_spawn_index < len(self.players):
@@ -359,9 +459,12 @@ class PresidentGame:
             for p in self.players:
                 if p.respawn_time > 0 and now_respawn >= p.respawn_time:
                     p.respawn_time = 0
-                    p.directionX = random.choice([-1, 1])
-                    p.directionY = random.choice([-1, 1])
                     p.spawn_piece()
+                    if self.big_cube:
+                        dx = self.big_cube['x'] - p.piece.x
+                        dy = self.big_cube['y'] - p.piece.y
+                        p.directionX = 1 if dx >= 0 else -1
+                        p.directionY = 1 if dy >= 0 else -1
                     print(f"Player {p.id} cube respawned!")
 
             # Check for clicks on active cubes via button inputs (channel 7)
@@ -369,6 +472,34 @@ class PresidentGame:
 
             # Handle queued immediate board hits from recv loop
             self.process_board_touch_queue()
+
+            # Big cube movement
+            now = time.time()
+            if now - self.big_cube_last_move >= self.big_cube_speed:
+                dx, dy = self.big_cube_direction
+                nx = self.big_cube['x'] + dx
+                ny = self.big_cube['y'] + dy
+                if not self._can_place_big_cube(nx, ny):
+                    # Pick a new random direction (not current)
+                    possible_dirs = [(0,1), (0,-1), (1,0), (-1,0)]
+                    if self.big_cube_direction in possible_dirs:
+                        possible_dirs.remove(self.big_cube_direction)
+                    random.shuffle(possible_dirs)
+                    for next_dx, next_dy in possible_dirs:
+                        if self._can_place_big_cube(self.big_cube['x'] + next_dx, self.big_cube['y'] + next_dy):
+                            self.big_cube_direction = (next_dx, next_dy)
+                            break
+                else:
+                    self.big_cube['x'] = nx
+                    self.big_cube['y'] = ny
+                self.big_cube_last_move = now
+            if now - self.big_cube_last_turn >= self.big_cube_turn_interval:
+                directions = [(0,1),(0,-1),(1,0),(-1,0)]
+                if self.big_cube_direction in directions:
+                    directions.remove(self.big_cube_direction)
+                self.big_cube_direction = random.choice(directions)
+                self.big_cube_turn_interval = random.uniform(2,5)
+                self.big_cube_last_turn = now
 
             if self.flashing_lines:
                 if time.time() - self.flash_start_time > self.flash_duration:
@@ -390,25 +521,44 @@ class PresidentGame:
                         if p.piece and p.piece.active:
                             # --- Y axis movement ---
                             dy = p.directionY
-                            if not self.is_collision(p.piece, player=p, dy=dy):
+                            collision_with_big = any(self.big_cube and (bx, by + dy) == (self.big_cube['x'], self.big_cube['y']) for bx, by in p.piece.get_absolute_blocks())
+                            if not collision_with_big and not self.is_collision(p.piece, player=p, dy=dy):
                                 p.piece.y += dy
                             else:
-                                # Reverse Y direction and try again
-                                p.directionY = -p.directionY
-                                dy = p.directionY
-                                if not self.is_collision(p.piece, player=p, dy=dy):
-                                    p.piece.y += dy
+                                if collision_with_big:
+                                    p.piece.active = False
+                                    p.piece = None
+                                    p.respawn_time = time.time() + self.respawn_delay
+                                    p.score = max(0, p.score - 1)
+                                    print(f"Player {p.id} hit big cube! Lost 1 point. Score: {p.score}")
+                                else:
+                                    # Reverse Y direction and try again
+                                    p.directionY = -p.directionY
+                                    dy = p.directionY
+                                    if not self.is_collision(p.piece, player=p, dy=dy):
+                                        p.piece.y += dy
+
+                            if not p.piece or not p.piece.active:
+                                continue
 
                             # --- X axis movement ---
                             dx = p.directionX
-                            if not self.is_collision(p.piece, player=p, dx=dx):
+                            collision_with_big = any(self.big_cube and (bx + dx, by) == (self.big_cube['x'], self.big_cube['y']) for bx, by in p.piece.get_absolute_blocks())
+                            if not collision_with_big and not self.is_collision(p.piece, player=p, dx=dx):
                                 p.piece.x += dx
                             else:
-                                # Reverse X direction and try again
-                                p.directionX = -p.directionX
-                                dx = p.directionX
-                                if not self.is_collision(p.piece, player=p, dx=dx):
-                                    p.piece.x += dx
+                                if collision_with_big:
+                                    p.piece.active = False
+                                    p.piece = None
+                                    p.respawn_time = time.time() + self.respawn_delay
+                                    p.score = max(0, p.score - 1)
+                                    print(f"Player {p.id} hit big cube! Lost 1 point. Score: {p.score}")
+                                else:
+                                    # Reverse X direction and try again
+                                    p.directionX = -p.directionX
+                                    dx = p.directionX
+                                    if not self.is_collision(p.piece, player=p, dx=dx):
+                                        p.piece.x += dx
                 
                 self.last_tick += frames_to_execute * self.current_fall_speed
 
@@ -459,26 +609,52 @@ class PresidentGame:
     def render(self):
         buffer = bytearray(FRAME_DATA_LENGTH)
 
+        # Use current color scheme
+        scheme = self.color_schemes[(self.round_number-1) % len(self.color_schemes)]
+        bg_color = scheme['bg']
+        obstacle_color = scheme['obstacle']
+        bullet_color = scheme['bullet']
+        car_color = scheme['car']
+
         if self.state == 'LOBBY':
-            # Pulse Separator
-            if int(time.time() * 2) % 2 == 0:
-                for x in range(16):
-                    self.set_led(buffer, x, 28, WHITE)
+            # No white bar at the bottom
             return buffer
 
-        if self.state == 'STARTUP':
-            step = self.startup_step
-            # Players Appearance
-            # for p in self.players:
-            #     if step > p.id:
-            #         self.draw_player_controls(buffer, p, p.id * 4)
+        if self.state == 'COUNTDOWN':
+            now = time.time()
+            elapsed = int(now - self.countdown_start_time)
+            remaining = self.countdown_seconds - elapsed
+            if remaining > 0:
+                self.draw_glyph(buffer, remaining, 6, 10, WHITE)
+            return buffer
 
-            # if step >= 4:
-            #     for x in range(16): self.set_led(buffer, x, 28, WHITE)
-
-            if 5 <= step <= 9:
-                num = 5 - (step - 5)
-                self.draw_glyph(buffer, num, 6, 10, WHITE)
+        if self.state == 'TRANSITION':
+            now = time.time()
+            elapsed = now - self.transition_start_time
+            total_tiles = BOARD_WIDTH * BOARD_HEIGHT
+            unravel_duration = self.transition_duration
+            fill_duration = unravel_duration / 2
+            unfill_duration = unravel_duration / 2
+            if elapsed < fill_duration:
+                # Fill phase (top-down on physical panel)
+                progress = min(1.0, elapsed / fill_duration)
+                tiles_to_fill = int(progress * total_tiles)
+                count = 0
+                for y in range(BOARD_HEIGHT - 1, -1, -1):
+                    for x in range(BOARD_WIDTH):
+                        if count < tiles_to_fill:
+                            self.set_led(buffer, x, y, WHITE)
+                            count += 1
+            elif elapsed < unravel_duration:
+                # Unfill phase (top-down on physical panel)
+                progress = min(1.0, (elapsed - fill_duration) / unfill_duration)
+                tiles_to_unfill = int(progress * total_tiles)
+                count = 0
+                for y in range(BOARD_HEIGHT - 1, -1, -1):
+                    for x in range(BOARD_WIDTH):
+                        if count < total_tiles - tiles_to_unfill:
+                            self.set_led(buffer, x, y, WHITE)
+                            count += 1
             return buffer
 
         if self.state == 'GAMEOVER':
@@ -498,43 +674,70 @@ class PresidentGame:
 
         if self.state == 'PLAYING':
             with self.lock:
-                flash_color = WHITE
-                if self.scoring_player: flash_color = self.scoring_player.color
-
-                # Stamp current cube positions into trail at full brightness
+                # Draw background
+                for y in range(BOARD_HEIGHT):
+                    for x in range(BOARD_WIDTH):
+                        self.set_led(buffer, x, y, bg_color)
+                # Draw input area (rows 28-31) with bg_color
+                for y in range(28, 32):
+                    for x in range(BOARD_WIDTH):
+                        self.set_led(buffer, x, y, bg_color)
+                # Draw obstacles
+                for x, y in self.current_obstacle_map:
+                    plus_pixels = [(0,0), (0,-1), (0,1), (-1,0), (1,0)]
+                    for dx, dy in plus_pixels:
+                        nx, ny = x + dx, y + dy
+                        if 0 <= nx < BOARD_WIDTH and 0 <= ny < BOARD_HEIGHT:
+                            self.set_led(buffer, nx, ny, obstacle_color)
+                # Draw big car
+                if self.big_cube:
+                    for cx, cy in self._big_cube_cells():
+                        if 0 <= cx < BOARD_WIDTH and 0 <= cy < BOARD_HEIGHT:
+                            self.set_led(buffer, cx, cy, car_color)
+                    window_x = self.big_cube['x']
+                    window_y = self.big_cube['y'] - 1
+                    if 0 <= window_x < BOARD_WIDTH and 0 <= window_y < BOARD_HEIGHT:
+                        self.set_led(buffer, window_x, window_y, BLUE)
+                # Draw player bullets
                 for p in self.players:
                     if p.piece and p.piece.active:
                         for bx, by in p.piece.get_absolute_blocks():
-                            if 0 <= by < BOARD_HEIGHT and 0 <= bx < BOARD_WIDTH:
-                                self.trail[by][bx] = 1.0
-                                self.trail_color[by][bx] = p.piece.color
-
-                for y in range(BOARD_HEIGHT):
-                    for x in range(BOARD_WIDTH):
-                        color = self.board[y][x]
-                        if y in self.flashing_lines: color = flash_color
-
-                        # Draw trail (faded color) if no board block
-                        if color == BLACK and self.trail[y][x] > 0.05:
-                            tc = self.trail_color[y][x]
-                            t = self.trail[y][x]
-                            color = (int(tc[0] * t), int(tc[1] * t), int(tc[2] * t))
-
-                        self.set_led(buffer, x, y, color)
-
-                # Active Pieces (drawn on top of trail)
+                            if 0 <= bx < BOARD_WIDTH and 0 <= by < BOARD_HEIGHT:
+                                self.set_led(buffer, bx, by, bullet_color)
+                # Draw player pieces
                 for p in self.players:
                     if p.piece and p.piece.active:
                         for bx, by in p.piece.get_absolute_blocks():
                             if 0 <= by < BOARD_HEIGHT and 0 <= bx < BOARD_WIDTH:
                                 self.set_led(buffer, bx, by, p.piece.color)
 
+                # Draw obstacles (already on board)
+
+                # Draw big car (protected object)
+                if self.big_cube:
+                    car_color = self.big_cube['color']
+                    for cx, cy in self._big_cube_cells():
+                        if 0 <= cx < BOARD_WIDTH and 0 <= cy < BOARD_HEIGHT:
+                            self.set_led(buffer, cx, cy, car_color)
+                    window_x = self.big_cube['x']
+                    window_y = self.big_cube['y'] - 1
+                    if 0 <= window_x < BOARD_WIDTH and 0 <= window_y < BOARD_HEIGHT:
+                        self.set_led(buffer, window_x, window_y, BLUE)
+                    # Optionally, add wheels (darker color)
+                    wheel_color = (32,32,32)
+                    for wx in [-1,1]:
+                        for wy in [1]:
+                            cx = self.big_cube['x'] + wx
+                            cy = self.big_cube['y'] + wy
+                            if 0 <= cx < BOARD_WIDTH and 0 <= cy < BOARD_HEIGHT:
+                                self.set_led(buffer, cx, cy, wheel_color)
+
                 # Decay trail for next frame
                 for y in range(BOARD_HEIGHT):
                     for x in range(BOARD_WIDTH):
                         self.trail[y][x] *= self.trail_decay
 
-            for x in range(16): self.set_led(buffer, x, 28, WHITE)
+            # for x in range(16): self.set_led(buffer, x, 28, WHITE)
             # for p in self.players:
             #     self.draw_player_controls(buffer, p, p.id * 4)
 
@@ -555,6 +758,28 @@ class PresidentGame:
             buffer[offset] = color[1]  # GREEN (Swap for hardware)
             buffer[offset + NUM_CHANNELS] = color[0]  # RED (Swap for hardware)
             buffer[offset + NUM_CHANNELS * 2] = color[2]
+
+    def _find_safe_spawn(self):
+        # Find a random (x, y) not in terrain
+        attempts = 0
+        while attempts < 100:
+            x = random.randint(0, BOARD_WIDTH-1)
+            y = random.randint(0, BOARD_HEIGHT-1)
+            # Check if (x, y) is not in any obstacle
+            is_safe = True
+            for ox, oy in self.current_obstacle_map:
+                for dx, dy in [(0,0), (0,-1), (0,1), (-1,0), (1,0)]:
+                    if x == ox + dx and y == oy + dy:
+                        is_safe = False
+                        break
+                if not is_safe:
+                    break
+            if is_safe:
+                return x, y
+            attempts += 1
+        # fallback: just return (0,0)
+        return 0, 0
+
 
 class NetworkManager:
     def __init__(self, game):
@@ -775,12 +1000,22 @@ if __name__ == "__main__":
                 game.running = False
                 break
             elif cmd.startswith('start'):
-                # try:
-                    num = int(cmd.split()[1])
-                    game.start_game(num)
-                    print(f"Started game with {num} players.")
-                # except:
-                #     print("Usage: start <num_players>")
+                parts = cmd.split()
+                if len(parts) >= 2 and parts[1].isdigit():
+                    num_players = int(parts[1])
+                    # Prompt for round duration
+                    while True:
+                        try:
+                            mins = int(input("Enter round duration in minutes: "))
+                            if mins > 0: break
+                        except Exception:
+                            pass
+                    game.round_duration_minutes = mins
+                    game.round_start_time = time.time()
+                    game.round_number = 1
+                    game.start_game(num_players)
+                else:
+                    print("Usage: start <num_players>")
             elif cmd == 'restart':
                 game.restart_round()
                 print("Restarted round.")
