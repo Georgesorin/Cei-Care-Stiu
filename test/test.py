@@ -1,0 +1,640 @@
+import socket
+import struct
+import time
+import threading
+import random
+import copy
+import psutil
+import os
+
+import json
+
+try:
+    import pygame
+    PYGAME_AVAILABLE = True
+except ImportError:
+    PYGAME_AVAILABLE = False
+
+# --- Configuration ---
+_CFG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tetris_config.json")
+
+def _load_config():
+    defaults = {
+        "device_ip": "255.255.255.255",
+        "send_port": 7270,
+        "recv_port": 7271,
+        "bind_ip": "0.0.0.0"
+    }
+    try:
+        if os.path.exists(_CFG_FILE):
+            with open(_CFG_FILE, encoding="utf-8") as f:
+                return {**defaults, **json.load(f)}
+    except: pass
+    return defaults
+
+CONFIG = _load_config()
+
+# --- Networking Constants ---
+UDP_SEND_IP = CONFIG.get("device_ip", "255.255.255.255")
+UDP_SEND_PORT = CONFIG.get("send_port", 7270)
+UDP_LISTEN_PORT = CONFIG.get("recv_port", 7271)
+
+# --- Matrix Constants ---
+NUM_CHANNELS = 8
+LEDS_PER_CHANNEL = 64
+FRAME_DATA_LENGTH = NUM_CHANNELS * LEDS_PER_CHANNEL * 3
+
+# Board Area: Channels 0-6 (Rows 0-27)
+BOARD_WIDTH = 16
+BOARD_HEIGHT = 32 
+
+# Input Area: Channel 7 (Rows 28-31)
+INPUT_CHANNEL = 7
+
+# --- Colors (R, G, B) ---
+BLACK = (0, 0, 0)
+WHITE = (255, 255, 255)
+RED = (255, 0, 0)
+YELLOW = (255, 255, 0)
+GREEN = (0, 255, 0)
+BLUE = (0, 0, 255)
+CYAN = (0, 255, 255)
+MAGENTA = (255, 0, 255)
+ORANGE = (255, 165, 0)
+
+# --- Password for Checksum (Optional, code now uses forced checksums in NetworkManager) ---
+PASSWORD_ARRAY = [
+    35, 63, 187, 69, 107, 178, 92, 76, 39, 69, 205, 37, 223, 255, 165, 231, 16, 220, 99, 61, 25, 203, 203, 
+    155, 107, 30, 92, 144, 218, 194, 226, 88, 196, 190, 67, 195, 159, 185, 209, 24, 163, 65, 25, 172, 126, 
+    63, 224, 61, 160, 80, 125, 91, 239, 144, 25, 141, 183, 204, 171, 188, 255, 162, 104, 225, 186, 91, 232, 
+    3, 100, 208, 49, 211, 37, 192, 20, 99, 27, 92, 147, 152, 86, 177, 53, 153, 94, 177, 200, 33, 175, 195, 
+    15, 228, 247, 18, 244, 150, 165, 229, 212, 96, 84, 200, 168, 191, 38, 112, 171, 116, 121, 186, 147, 203, 
+    30, 118, 115, 159, 238, 139, 60, 57, 235, 213, 159, 198, 160, 50, 97, 201, 242, 240, 77, 102, 12, 
+    183, 235, 243, 247, 75, 90, 13, 236, 56, 133, 150, 128, 138, 190, 140, 13, 213, 18, 7, 117, 255, 45, 69, 
+    214, 179, 50, 28, 66, 123, 239, 190, 73, 142, 218, 253, 5, 212, 174, 152, 75, 226, 226, 172, 78, 35, 93, 
+    250, 238, 19, 32, 247, 233, 89, 123, 86, 138, 150, 146, 214, 192, 93, 152, 156, 211, 67, 51, 195, 165, 
+    66, 10, 10, 31, 1, 198, 234, 135, 34, 128, 208, 200, 213, 169, 238, 74, 221, 208, 104, 170, 166, 36, 76, 
+    177, 196, 3, 141, 167, 127, 56, 177, 203, 45, 107, 46, 82, 217, 139, 168, 45, 198, 6, 43, 11, 57, 88, 
+    182, 84, 189, 29, 35, 143, 138, 171
+]
+
+# --- Font Data (3x5 or similar) ---
+FONT = {
+    1: [(1,0), (1,1), (1,2), (1,3), (1,4)], # Center vertical
+    2: [(0,0), (1,0), (2,0), (2,1), (1,2), (0,2), (0,3), (0,4), (1,4), (2,4)],
+    3: [(0,0), (1,0), (2,0), (2,1), (1,2), (2,2), (2,3), (0,4), (1,4), (2,4)],
+    4: [(0,0), (0,1), (0,2), (1,2), (2,2), (2,0), (2,1), (2,3), (2,4)],
+    5: [(0,0), (1,0), (2,0), (0,1), (0,2), (1,2), (2,2), (2,3), (0,4), (1,4), (2,4)],
+    'W': [(0,0),(0,1),(0,2),(0,3),(0,4), (4,0),(4,1),(4,2),(4,3),(4,4), (1,3),(2,2),(3,3)], # Wide W
+    'I': [(0,0),(1,0),(2,0), (1,1),(1,2),(1,3), (0,4),(1,4),(2,4)],
+    'N': [(0,0),(0,1),(0,2),(0,3),(0,4), (3,0),(3,1),(3,2),(3,3),(3,4), (1,1),(2,2)] # Compact N
+}
+
+# Input Configuration
+INPUT_REPEAT_RATE = 0.25  # Seconds per move when holding
+INPUT_INITIAL_DELAY = 0.5 # Initial delay before repeat starts
+
+
+class Player:
+    """Player class for tracking score and input control"""
+    def __init__(self):
+        self.points = 0
+        self.control_rows = [1, 2, 3, 4, 5]  # Control pad rows for groups 0-4
+        self.control_column = 1  # Control pads are at column 1
+        self.last_scored_states = {}  # Track which flashes we've already scored
+
+    def get_led_index(self, x, y):
+        """Convert (x, y) board position to LED index for button checking"""
+        # This maps board coordinates to button state index
+        channel = y // 4
+        row_in_channel = y % 4
+        if row_in_channel % 2 == 0:
+            led_index = row_in_channel * 16 + x
+        else:
+            led_index = row_in_channel * 16 + (15 - x)
+        return led_index
+
+    def check_hit(self, group_index, x, y, button_states):
+        """
+        Check if player hits the raindrop at position (x, y) for given group.
+        Returns True if hit and points were awarded.
+        """
+        # Only group 0 (left side) controls
+        if group_index != 0:
+            return False
+
+        # Check if this position has a button and if it's pressed
+        if x == self.control_column and y in self.control_rows:
+            state_key = (group_index, y)
+            
+            # Get the LED index for this button
+            led_index = self.get_led_index(x, y)
+            
+            # Check if button is pressed and we haven't already scored for this flash
+            if led_index < len(button_states) and button_states[led_index]:
+                if state_key not in self.last_scored_states:
+                    self.points += 1
+                    self.last_scored_states[state_key] = True
+                    print(f"Hit! Points: {self.points}")
+                    return True
+        
+        return False
+
+    def reset_hit_for_state(self, group_index, y):
+        """Reset hit tracking for a specific group/row combination"""
+        state_key = (group_index, y)
+        if state_key in self.last_scored_states:
+            del self.last_scored_states[state_key]
+
+
+def calculate_checksum(data):
+    acc = sum(data)
+    idx = acc & 0xFF
+    return PASSWORD_ARRAY[idx] if idx < len(PASSWORD_ARRAY) else 0
+
+class TestGame:
+    def __init__(self):
+        self.board = [[BLACK for _ in range(BOARD_WIDTH)] for _ in range(BOARD_HEIGHT)]
+
+        self.running = True
+        self.state = 'LOBBY' # LOBBY, STARTUP, PLAYING, GAMEOVER
+        self.startup_step = 0
+        self.startup_timer = time.time()
+
+        self.lock = threading.RLock()
+        
+        # Initialize player and controls
+        self.player = Player()
+        self.button_states = [False] * 64  # Track button press states
+
+    def reset_board(self):
+        self.board = [[BLACK for _ in range(BOARD_WIDTH)] for _ in range(BOARD_HEIGHT)]
+
+    def set_led(self, buffer, x, y, color):
+        if x < 0 or x >= 16: return
+        channel = y // 4
+        if channel >= 8: return
+        row_in_channel = y % 4
+        if row_in_channel % 2 == 0: led_index = row_in_channel * 16 + x
+        else: led_index = row_in_channel * 16 + (15 - x)
+        block_size = NUM_CHANNELS * 3
+        offset = led_index * block_size + channel
+        if offset + NUM_CHANNELS*2 < len(buffer):
+            buffer[offset] = color[1] # GREEN (Swap for hardware)
+            buffer[offset + NUM_CHANNELS] = color[0] # RED (Swap for hardware)
+            buffer[offset + NUM_CHANNELS*2] = color[2]
+
+
+    def start_game(self):
+        with self.lock:
+            self.reset_board()
+            self.state = 'STARTUP'
+            self.startup_step = 0
+
+    def render(self):
+        # Create a blank frame buffer
+        frame_buffer = bytearray(FRAME_DATA_LENGTH)
+        
+        # Matrix Rain effect with 4 columns in the middle, each with unique color
+        MATRIX_COLORS = [MAGENTA, CYAN, GREEN, RED]  # (255,0,255), (0,255,255), (0,255,0), (255,0,0)
+        ACTIVE_COLUMNS = [6, 7, 8, 9]  # 4 columns in the middle of 16-column display
+        
+        if not hasattr(self, 'rain_drops'):
+            self.rain_drops = {}
+            self.time_counter = 0
+            # Initialize drops only for active columns
+            for i, col in enumerate(ACTIVE_COLUMNS):
+                self.rain_drops[col] = random.randint(-10, 0)
+        
+        # Fade existing pixels
+        for y in range(BOARD_HEIGHT):
+            for x in range(BOARD_WIDTH):
+                # Get current color from board (for fading effect)
+                current_color = self.board[y][x]
+                r_fade = max(0, current_color[0] - 25) if current_color[0] > 0 else 0
+                g_fade = max(0, current_color[1] - 25) if current_color[1] > 0 else 0
+                b_fade = max(0, current_color[2] - 25) if current_color[2] > 0 else 0
+                faded_color = (r_fade, g_fade, b_fade)
+                self.set_led(frame_buffer, x, y, faded_color)
+                self.board[y][x] = faded_color  # Update board with faded color
+        
+        # ===========================================
+        # MATRIX BORDER AND CENTER COLUMN
+        # ===========================================
+        # Draw white border around perimeter and vertical center column
+
+        # Draw white border around the entire matrix perimeter
+        for x in range(BOARD_WIDTH):
+            # Top border (row 0)
+            self.set_led(frame_buffer, x, 0, WHITE)
+            self.board[0][x] = WHITE
+            # Bottom border (last row)
+            self.set_led(frame_buffer, x, BOARD_HEIGHT - 1, WHITE)
+            self.board[BOARD_HEIGHT - 1][x] = WHITE
+
+        for y in range(BOARD_HEIGHT):
+            # Left border (column 0)
+            self.set_led(frame_buffer, 0, y, WHITE)
+            self.board[y][0] = WHITE
+            # Right border (last column)
+            self.set_led(frame_buffer, BOARD_WIDTH - 1, y, WHITE)
+            self.board[y][BOARD_WIDTH - 1] = WHITE
+
+        # Draw white vertical center columns (middle of 16 columns = columns 7 & 8)
+        CENTER_COLUMN = BOARD_WIDTH // 2  # Column 8
+        CENTER_COLUMN_LEFT = CENTER_COLUMN - 1  # Column 7
+
+        for y in range(BOARD_HEIGHT):
+            self.set_led(frame_buffer, CENTER_COLUMN, y, WHITE)
+            self.board[y][CENTER_COLUMN] = WHITE
+
+            self.set_led(frame_buffer, CENTER_COLUMN_LEFT, y, WHITE)
+            self.board[y][CENTER_COLUMN_LEFT] = WHITE
+
+        # Draw horizontal lines at rows 6n (0,6,12) - uses every sixth row
+        for y in range(0, BOARD_HEIGHT, 6):
+            for x in range(BOARD_WIDTH):
+                # Keep border and center line as white too
+                self.set_led(frame_buffer, x, y, WHITE)
+                self.board[y][x] = WHITE
+
+        # ===========================================
+        # HORIZONTAL MATRIX RAIN FROM CENTER AREA
+        # ===========================================
+        # 5 row pairs, drops spawn from center column area, move left together
+
+        # Define the target position and row groups
+        LEFT_EDGE = 1  # Stop at left edge (column 0)
+        RIGHT_EDGE = BOARD_WIDTH - 2  # Stop before right border (column 14)
+
+        # Left-moving groups (original)
+        ROW_GROUPS_LEFT = [
+            (1, 7, 13, 19, 26),   # Group 0 (Top)
+            (2, 8, 14, 20, 27),   # Group 1 (Upper-Middle)
+            (3, 9, 15, 21, 28),   # Group 2 (Upper-Middle)
+            (4, 10, 16, 22, 29),  # Group 3 (Middle)
+            (5, 11, 17, 23, 30)   # Group 4 (Bottom)
+        ]
+
+        # Right-moving groups (mirrored)
+        ROW_GROUPS_RIGHT = [
+            (1, 7, 13, 19, 26),   # Group 5 (Top, moving right)
+            (2, 8, 14, 20, 27),   # Group 6 (Upper-Middle, moving right)
+            (3, 9, 15, 21, 28),   # Group 7 (Upper-Middle, moving right)
+            (4, 10, 16, 22, 29),  # Group 8 (Middle, moving right)
+            (5, 11, 17, 23, 30)   # Group 9 (Bottom, moving right)
+        ]
+
+        # All groups combined
+        ROW_GROUPS = ROW_GROUPS_LEFT + ROW_GROUPS_RIGHT
+
+        # Colors for each group (shared across all rows in that group)
+        GROUP_COLORS = [MAGENTA, CYAN, GREEN, RED, YELLOW] * 2  # Repeat for both sides
+
+
+        # ===========================================
+        # INITIALIZE DROP STATES (FIRST TIME ONLY)
+        # ===========================================
+
+        if not hasattr(self, 'group_states'):
+            self.group_states = {}         # States: 'waiting', 'moving', 'flashing'
+            self.group_positions = {}      # X positions for each group
+            self.group_flash_timers = {}   # Flash duration timers
+            self.group_speed_counters = {} # Speed control counters
+            self.group_directions = {}     # Direction: -1 for left, +1 for right
+
+            self.global_spawn_timer = 0
+
+            for group_index in range(len(ROW_GROUPS)):
+                self.group_states[group_index] = 'waiting'
+                # Left groups (0-4) start right of center, right groups (5-9) start left of center
+                if group_index < 5:
+                    self.group_positions[group_index] = CENTER_COLUMN + 1
+                    self.group_directions[group_index] = -1  # Move left
+                else:
+                    self.group_positions[group_index] = CENTER_COLUMN - 1
+                    self.group_directions[group_index] = 1   # Move right
+
+                self.group_flash_timers[group_index] = 0
+                self.group_speed_counters[group_index] = 0
+
+
+        # ===========================================
+        # RANDOM PAIRED GROUP SPAWNING SYSTEM
+        # ===========================================
+        # Left and right groups spawn together in pairs
+
+        self.global_spawn_timer += 1
+
+        if self.global_spawn_timer >= random.randint(10, 20):
+            # Find pairs where both left and right groups are waiting
+            available_pairs = []
+            for pair_index in range(5):
+                left_idx = pair_index
+                right_idx = pair_index + 5
+                if self.group_states[left_idx] == 'waiting' and self.group_states[right_idx] == 'waiting':
+                    available_pairs.append((left_idx, right_idx))
+
+            if available_pairs:
+                left_group, right_group = random.choice(available_pairs)
+                
+                # Spawn both groups
+                self.group_states[left_group] = 'moving'
+                self.group_positions[left_group] = CENTER_COLUMN - 1
+                
+                self.group_states[right_group] = 'moving'
+                self.group_positions[right_group] = CENTER_COLUMN + 1
+
+            self.global_spawn_timer = 0
+
+
+        # ===========================================
+        # PROCESS EACH GROUP'S DROP STATE
+        # ===========================================
+
+        for group_index, group_rows in enumerate(ROW_GROUPS):
+            group_color = GROUP_COLORS[group_index]
+            state = self.group_states[group_index]
+            direction = self.group_directions[group_index]
+
+            if state == 'moving':
+                # Check if reached edge (different edge for left vs right movement)
+                if direction == -1:  # Moving left
+                    if self.group_positions[group_index] > LEFT_EDGE:
+                        self.group_speed_counters[group_index] += 1
+                        if self.group_speed_counters[group_index] >= 2:
+                            self.group_positions[group_index] -= 1
+                            self.group_speed_counters[group_index] = 0
+                    else:
+                        self.group_states[group_index] = 'flashing'
+                        self.group_flash_timers[group_index] = 0
+                else:  # Moving right
+                    if self.group_positions[group_index] < RIGHT_EDGE:
+                        self.group_speed_counters[group_index] += 1
+                        if self.group_speed_counters[group_index] >= 2:
+                            self.group_positions[group_index] += 1
+                            self.group_speed_counters[group_index] = 0
+                    else:
+                        self.group_states[group_index] = 'flashing'
+                        self.group_flash_timers[group_index] = 0
+
+            elif state == 'flashing':
+                self.group_flash_timers[group_index] += 1
+                
+                # Check for player hits during flashing (when tile is white)
+                if group_index == 0:
+                    drop_x = self.group_positions[group_index]
+                    for row in group_rows:
+                        # Get the LED index for this button pad
+                        led_index = self.player.get_led_index(drop_x, row)
+                        # Check if button is pressed while tile is white
+                        if led_index < len(self.button_states) and self.button_states[led_index]:
+                            self.player.points += 1
+                            print(f"HIT! Points: {self.player.points}")
+                
+                if self.group_flash_timers[group_index] >= 3:
+                    self.group_states[group_index] = 'waiting'
+
+            # ===========================================
+            # DRAW THE GROUP BASED ON CURRENT STATE
+            # ===========================================
+
+            drop_x = self.group_positions[group_index]
+            if 0 <= drop_x < BOARD_WIDTH:
+                for row in group_rows:
+                    if state == 'moving':
+                        self.set_led(frame_buffer, drop_x, row, group_color)
+                        self.board[row][drop_x] = group_color
+                    elif state == 'flashing':
+                        self.set_led(frame_buffer, drop_x, row, WHITE)
+                        self.board[row][drop_x] = WHITE
+
+        # Step 3: Update animation timing
+        self.time_counter += 1
+
+        # Return the completed frame buffer
+        return frame_buffer
+    
+
+    def tick(self):
+        with self.lock:
+            if self.state == 'LOBBY':
+                return
+
+            if self.state == 'STARTUP':
+                now = time.time()
+                delay = 0.2 if self.startup_step < 5 else 1.0
+                if now - self.startup_timer > delay:
+                    self.startup_step += 1
+                    self.startup_timer = now
+                    if self.startup_step >= 10:
+                        print("FIGHT! Game Starting...")
+                        self.state = 'PLAYING'
+                        self.game_start_time = time.time()
+                        self.spawn_all()
+                return
+
+            if self.state == 'GAMEOVER':
+                now = time.time()
+                if now - self.game_over_timer > 0.5:
+                    self.game_over_timer = now
+                    self.winner_flash_count += 1
+                return
+
+class NetworkManager:
+    def __init__(self, game):
+        self.game = game
+        self.sock_send = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock_send.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        self.sock_recv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.running = True
+        self.sequence_number = 0
+        self.prev_button_states = [False] * 64
+        
+        # Auto-Bind Logic: If no bind_ip specified, we stay on 0.0.0.0 (default)
+        bind_ip = CONFIG.get("bind_ip", "0.0.0.0")
+        
+        # We try to bind if a specific IP was requested, but fallback gracefully
+        if bind_ip != "0.0.0.0":
+            try: 
+                self.sock_send.bind((bind_ip, 0))
+            except Exception as e: 
+                print(f"Warning: Could not bind send socket to {bind_ip} (Routing via default): {e}")
+        
+        try:
+            self.sock_recv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.sock_recv.bind(("0.0.0.0", UDP_LISTEN_PORT))
+        except Exception as e:
+            print(f"Critical Error: Could not bind receive socket to port {UDP_LISTEN_PORT}: {e}")
+            self.running = False
+
+    def send_loop(self):
+        while self.running:
+            frame = self.game.render()
+            self.send_packet(frame)
+            time.sleep(0.05) 
+
+    def send_packet(self, frame_data):
+        # Protocol v11 Implementation
+        self.sequence_number = (self.sequence_number + 1) & 0xFFFF
+        if self.sequence_number == 0: self.sequence_number = 1
+        
+        target_ip = UDP_SEND_IP
+        port = UDP_SEND_PORT
+        
+        # --- 1. Start Packet ---
+        rand1 = random.randint(0, 127)
+        rand2 = random.randint(0, 127)
+        start_packet = bytearray([
+            0x75, rand1, rand2, 0x00, 0x08, 
+            0x02, 0x00, 0x00, 0x33, 0x44,   
+            (self.sequence_number >> 8) & 0xFF,
+            self.sequence_number & 0xFF,
+            0x00, 0x00, 0x00 
+        ])
+        start_packet.append(0x0E) # Force Checksum
+        start_packet.append(0x00) 
+        try: 
+            self.sock_send.sendto(start_packet, (target_ip, port))
+            self.sock_send.sendto(start_packet, ("127.0.0.1", port))
+        except: pass
+
+        # --- 2. FFF0 Packet ---
+        rand1 = random.randint(0, 127)
+        rand2 = random.randint(0, 127)
+        
+        # Payload size fixed for 8 channels * 64 LEDs
+        fff0_payload = bytearray()
+        for _ in range(NUM_CHANNELS):
+            fff0_payload += bytes([(LEDS_PER_CHANNEL >> 8) & 0xFF, LEDS_PER_CHANNEL & 0xFF])
+
+        fff0_internal = bytearray([
+            0x02, 0x00, 0x00, 
+            0x88, 0x77, 
+            0xFF, 0xF0, 
+            (len(fff0_payload) >> 8) & 0xFF, (len(fff0_payload) & 0xFF)
+        ]) + fff0_payload
+        
+        fff0_len = len(fff0_internal) - 1
+        
+        fff0_packet = bytearray([
+            0x75, rand1, rand2, 
+            (fff0_len >> 8) & 0xFF, (fff0_len & 0xFF)
+        ]) + fff0_internal
+        fff0_packet.append(0x1E) # Force Checksum
+        fff0_packet.append(0x00) 
+        
+        try: 
+            self.sock_send.sendto(fff0_packet, (target_ip, port))
+            self.sock_send.sendto(fff0_packet, ("127.0.0.1", port))
+        except: pass
+        
+        # --- 3. Data Packets ---
+        chunk_size = 984 
+        data_packet_index = 1
+        
+        for i in range(0, len(frame_data), chunk_size):
+            rand1 = random.randint(0, 127)
+            rand2 = random.randint(0, 127)
+
+            chunk = frame_data[i:i+chunk_size]
+            
+            internal_data = bytearray([
+                0x02, 0x00, 0x00, 
+                (0x8877 >> 8) & 0xFF, (0x8877 & 0xFF), 
+                (data_packet_index >> 8) & 0xFF, (data_packet_index & 0xFF), 
+                (len(chunk) >> 8) & 0xFF, (len(chunk) & 0xFF) 
+            ])
+            internal_data += chunk
+            
+            payload_len = len(internal_data) - 1 
+            
+            packet = bytearray([
+                0x75, rand1, rand2,
+                (payload_len >> 8) & 0xFF, (payload_len & 0xFF)
+            ]) + internal_data
+            
+            if len(chunk) == 984:
+                packet.append(0x1E) 
+            else:
+                packet.append(0x36) 
+                
+            packet.append(0x00)
+            
+            try: 
+                self.sock_send.sendto(packet, (target_ip, port))
+                self.sock_send.sendto(packet, ("127.0.0.1", port))
+            except: pass
+            
+            data_packet_index += 1
+            time.sleep(0.005) # Slight delay
+
+        # --- 4. End Packet ---
+        rand1 = random.randint(0, 127)
+        rand2 = random.randint(0, 127)
+        end_packet = bytearray([
+            0x75, rand1, rand2, 0x00, 0x08,
+            0x02, 0x00, 0x00, 0x55, 0x66,
+            (self.sequence_number >> 8) & 0xFF,
+            self.sequence_number & 0xFF,
+            0x00, 0x00, 0x00 
+        ])
+        end_packet.append(0x0E) 
+        end_packet.append(0x00) 
+        try: 
+            self.sock_send.sendto(end_packet, (target_ip, port))
+            self.sock_send.sendto(end_packet, ("127.0.0.1", port))
+        except: pass
+
+    def recv_loop(self):
+        while self.running:
+            try:
+                data, _ = self.sock_recv.recvfrom(2048)
+                if len(data) >= 1373 and data[0] == 0x88:
+                    offset = 2 + (7 * 171) + 1 
+                    ch8_data = data[offset : offset + 170]
+                    for led_idx, val in enumerate(ch8_data):
+                        if led_idx >= 64: break
+                        is_pressed = (val == 0xCC)
+                        
+                        # Sync state to game active list
+                        # Logic now handled in Game.tick() -> process_inputs()
+                        self.game.button_states[led_idx] = is_pressed
+                        
+            except Exception:
+                pass
+
+    def start_bg(self):
+        t1 = threading.Thread(target=self.send_loop)
+        t2 = threading.Thread(target=self.recv_loop)
+        t1.daemon = True
+        t2.daemon = True
+        t1.start()
+        t2.start()
+
+def game_thread_func(game):
+    while game.running:
+        game.tick()
+        time.sleep(0.01)
+
+if __name__ == "__main__":
+    game = TestGame()
+    net = NetworkManager(game)
+    net.start_bg()
+
+    gt = threading.Thread(target=game_thread_func, args=(game,))
+    gt.daemon = True
+    gt.start()
+
+    print("Game is running. Press Ctrl+C to exit.")
+          
+    try:
+        while game.running:
+            cmd = input("> ").strip().lower()
+            if cmd == "exit":
+                game.running = False
+    except KeyboardInterrupt:
+        game.running = False
+
+    net.running = False
+    print("Exiting...")
