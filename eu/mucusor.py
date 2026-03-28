@@ -6,6 +6,7 @@ import random
 import copy
 import psutil
 import os
+from collections import deque
 
 import json
 
@@ -25,8 +26,8 @@ _CFG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tetris_con
 def _load_config():
     defaults = {
         "device_ip": "255.255.255.255",
-        "send_port": 7270,
-        "recv_port": 7271,
+        "send_port": 7272,
+        "recv_port": 7273,
         "bind_ip": "0.0.0.0"
     }
     try:
@@ -42,8 +43,8 @@ CONFIG = _load_config()
 
 # --- Networking Constants ---
 UDP_SEND_IP = CONFIG.get("device_ip", "255.255.255.255")
-UDP_SEND_PORT = CONFIG.get("send_port", 7271)
-UDP_LISTEN_PORT = CONFIG.get("recv_port", 7270)
+UDP_SEND_PORT = CONFIG.get("send_port", 7273)
+UDP_LISTEN_PORT = CONFIG.get("recv_port", 7272)
 
 # --- Matrix Constants ---
 NUM_CHANNELS = 8
@@ -70,13 +71,13 @@ ORANGE = (255, 165, 0)
 
 # Tetris Shapes
 SHAPES = {
-    'I': [(-1, 0), (0, 0), (1, 0), (2, 0)],
-    'O': [(0, 0), (1, 0), (0, 1), (1, 1)],
-    'T': [(-1, 0), (0, 0), (1, 0), (0, 1)],
-    'S': [(0, 0), (1, 0), (-1, 1), (0, 1)],
-    'Z': [(-1, 0), (0, 0), (0, 1), (1, 1)],
-    'J': [(-1, 0), (0, 0), (1, 0), (1, 1)],
-    'L': [(-1, 0), (0, 0), (1, 0), (-1, 1)]
+    # 'I': [(-1, 0), (0, 0), (1, 0), (2, 0)],
+    'O': [(0, 0)],
+    # 'T': [(-1, 0), (0, 0), (1, 0), (0, 1)],
+    # 'S': [(0, 0), (1, 0), (-1, 1), (0, 1)],
+    # 'Z': [(-1, 0), (0, 0), (0, 1), (1, 1)],
+    # 'J': [(-1, 0), (0, 0), (1, 0), (1, 1)],
+    # 'L': [(-1, 0), (0, 0), (1, 0), (-1, 1)]
 }
 
 SHAPE_COLORS = {
@@ -156,15 +157,19 @@ class Player:
         self.col_min = start_col_min
         self.col_max = start_col_max
         self.piece = None
+        self.directionX = random.choice([-1, 1])
+        self.directionY = random.choice([-1, 1])
         self.score = 0
         self.input_cooldown = 0
         self.next_shape_key = random.choice(list(SHAPES.keys()))
+        self.respawn_time = 0  # when to respawn (0 = not waiting)
 
     def spawn_piece(self):
         shape_key = self.next_shape_key
         self.next_shape_key = random.choice(list(SHAPES.keys()))
-        spawn_x = (self.col_min + self.col_max) // 2
-        self.piece = PresidentialVehicle(shape_key, self.color, spawn_x, 0)
+        spawn_x = random.randint(0, BOARD_WIDTH - 1)
+        spawn_y = random.randint(0, BOARD_HEIGHT - 1)
+        self.piece = PresidentialVehicle(shape_key, self.color, spawn_x, spawn_y)
 
 class PresidentGame:
     def __init__(self):
@@ -176,11 +181,13 @@ class PresidentGame:
         self.startup_step = 0
         self.startup_timer = time.time()
 
-        self.base_fall_speed = 1.0
+        self.base_fall_speed = 0.6
         self.current_fall_speed = self.base_fall_speed
         self.min_fall_speed = 0.1
         self.last_tick = time.time()
         self.game_start_time = time.time()
+
+        self.lock = threading.RLock()
 
         # Flashing/Clearing State
         self.flashing_lines = []
@@ -192,12 +199,362 @@ class PresidentGame:
         self.winner_flash_count = 0
         self.game_over_timer = 0
 
+        # Motion trail for smooth visuals
+        self.trail = [[0.0 for _ in range(BOARD_WIDTH)] for _ in range(BOARD_HEIGHT)]
+        self.trail_color = [[BLACK for _ in range(BOARD_WIDTH)] for _ in range(BOARD_HEIGHT)]
+        self.trail_decay = 0.7  # multiplier per render frame (lower = faster fade)
+
+        # Sequential spawn
+        self.spawn_interval = 3.0  # seconds between each new cube
+        self.next_spawn_index = 0
+        self.last_spawn_time = 0
+
+        # Board touch detection (all channels, 28 rows x 16 cols)
+        self.board_pressed = [[False for _ in range(BOARD_WIDTH)] for _ in range(BOARD_HEIGHT)]
+        self.prev_board_pressed = [[False for _ in range(BOARD_WIDTH)] for _ in range(BOARD_HEIGHT)]
+        self.respawn_delay = 5.0  # seconds before a clicked cube respawns
+        self.board_touch_queue = deque()  # event queue for new press events
+
         # Input State for Visualization & Logic
         self.button_states = [False] * 64
         self.prev_button_states = [False] * 64
         # Key: (player_id, action_str) -> Value: next_trigger_time
         self.input_timers = {}
 
+    def setup_players(self, count):
+        self.players = []
+        if count < 1: count = 1
+        # if count > 4: count = 4
+
+        colors = [RED, YELLOW, GREEN, BLUE]
+
+        width = 16 // count
+        for i in range(count):
+            start = i * width
+            end = start + width - 1
+            if i == count - 1: end = 15
+
+            color_index = random.randint(0, len(colors) - 1)
+            p = Player(i, colors[color_index], start, end)
+            self.players.append(p)
+
+    def start_game(self, num_players):
+        with self.lock:
+            self.setup_players(num_players)
+            self.reset_board()
+            # self.sound.start_bgm()
+            self.state = 'STARTUP'
+            self.startup_step = 0
+            self.startup_timer = time.time()
+            self.flashing_lines = []
+
+    def restart_round(self):
+        with self.lock:
+            count = len(self.players)
+            self.start_game(count)
+
+    def spawn_all(self):
+        for p in self.players:
+            p.spawn_piece()
+
+    def _spawn_next(self):
+        if self.next_spawn_index < len(self.players):
+            self.players[self.next_spawn_index].spawn_piece()
+            self.next_spawn_index += 1
+
+    def process_inputs(self):
+        """Check button presses (channel 7) and delete cubes at the pressed column."""
+        for i in range(64):
+            is_pressed = self.button_states[i]
+            was_pressed = self.prev_button_states[i]
+
+            if is_pressed and not was_pressed:  # Fresh press only
+                # Map button LED index to column X (same serpentine mapping as set_led)
+                row_in_channel = i // 16
+                col_raw = i % 16
+                x = col_raw if (row_in_channel % 2 == 0) else (15 - col_raw)
+
+                # Find and delete any cube at this column
+                for p in self.players:
+                    if p.piece and p.piece.active:
+                        for bx, by in p.piece.get_absolute_blocks():
+                            if bx == x:
+                                p.piece.active = False
+                                p.piece = None
+                                p.respawn_time = time.time() + self.respawn_delay
+                                p.score += 1
+                                print(f"Player {p.id} cube hit at column {x}! Score: {p.score}")
+                                break
+                        if p.piece is None:
+                            break  # Already deleted, stop checking
+
+            self.prev_button_states[i] = is_pressed
+
+    def update_speed(self):
+        elapsed = time.time() - self.game_start_time
+        # Reduce fall time by 0.05s every 10 seconds (0.6 -> 0.1 over ~100s)
+        reduction = (elapsed // 10) * 0.05
+        self.current_fall_speed = max(self.min_fall_speed, self.base_fall_speed - reduction)
+
+    def is_collision(self, piece, player=None, dx=0, dy=0, absolute_blocks=None):
+        blocks = absolute_blocks if absolute_blocks else piece.get_absolute_blocks()
+        for bx, by in blocks:
+            nx, ny = bx + dx, by + dy
+            # Wall collision
+            if nx < 0 or nx >= BOARD_WIDTH or ny >= BOARD_HEIGHT or ny < 0:
+                return True
+
+            # Locked Board collision
+            if self.board[ny][nx] != BLACK:
+                return True
+
+            # Other Active Pieces Collision
+            for other in self.players:
+                if other.piece and other.piece.active and other.piece != piece:
+                    for obx, oby in other.piece.get_absolute_blocks():
+                        if nx == obx and ny == oby:
+                            return True
+        return False
+
+    def tick(self):
+        with self.lock:
+            if self.state == 'LOBBY':
+                return
+
+            if self.state == 'STARTUP':
+                now = time.time()
+                delay = 0.2 if self.startup_step < 5 else 1.0
+                if now - self.startup_timer > delay:
+                    self.startup_step += 1
+                    self.startup_timer = now
+                    if self.startup_step >= 10:
+                        print("FIGHT! Game Starting...")
+                        self.state = 'PLAYING'
+                        self.game_start_time = time.time()
+                        self.last_tick = time.time()
+                        # Spawn only the first cube; rest spawn sequentially
+                        self.next_spawn_index = 0
+                        self.last_spawn_time = time.time()
+                        self._spawn_next()
+                return
+
+            if self.state == 'GAMEOVER':
+                now = time.time()
+                if now - self.game_over_timer > 0.5:
+                    self.game_over_timer = now
+                    self.winner_flash_count += 1
+                return
+
+            # --- PLAYING STATE ---
+
+            # Sequential spawning
+            if self.next_spawn_index < len(self.players):
+                now_spawn = time.time()
+                if now_spawn - self.last_spawn_time >= self.spawn_interval:
+                    self._spawn_next()
+                    self.last_spawn_time = now_spawn
+
+            # Check for respawns
+            now_respawn = time.time()
+            for p in self.players:
+                if p.respawn_time > 0 and now_respawn >= p.respawn_time:
+                    p.respawn_time = 0
+                    p.directionX = random.choice([-1, 1])
+                    p.directionY = random.choice([-1, 1])
+                    p.spawn_piece()
+                    print(f"Player {p.id} cube respawned!")
+
+            # Check for clicks on active cubes via button inputs (channel 7)
+            self.process_inputs()
+
+            # Handle queued immediate board hits from recv loop
+            self.process_board_touch_queue()
+
+            if self.flashing_lines:
+                if time.time() - self.flash_start_time > self.flash_duration:
+                    self.process_cleared_lines()
+                return
+
+            self.update_speed()
+            now = time.time()
+            elapsed = now - self.last_tick
+            
+            # Cap maximum frames per tick to prevent burst-after-lag behavior
+            # but allow graceful catch-up over time
+            if elapsed >= self.current_fall_speed:
+                frames_owed = int(elapsed / self.current_fall_speed)
+                frames_to_execute = min(frames_owed, 3)  # Execute max 3 frames per tick
+                
+                for _ in range(frames_to_execute):
+                    for p in self.players:
+                        if p.piece and p.piece.active:
+                            # --- Y axis movement ---
+                            dy = p.directionY
+                            if not self.is_collision(p.piece, player=p, dy=dy):
+                                p.piece.y += dy
+                            else:
+                                # Reverse Y direction and try again
+                                p.directionY = -p.directionY
+                                dy = p.directionY
+                                if not self.is_collision(p.piece, player=p, dy=dy):
+                                    p.piece.y += dy
+
+                            # --- X axis movement ---
+                            dx = p.directionX
+                            if not self.is_collision(p.piece, player=p, dx=dx):
+                                p.piece.x += dx
+                            else:
+                                # Reverse X direction and try again
+                                p.directionX = -p.directionX
+                                dx = p.directionX
+                                if not self.is_collision(p.piece, player=p, dx=dx):
+                                    p.piece.x += dx
+                
+                self.last_tick += frames_to_execute * self.current_fall_speed
+
+    def reset_board(self):
+        self.board = [[BLACK for _ in range(BOARD_WIDTH)] for _ in range(BOARD_HEIGHT)]
+
+    def handle_board_click(self, x, y):
+        # Immediate hit detection for board touches.
+        # Allow a small hit window to reduce timing/prediction reliance.
+        for p in self.players:
+            if not (p.piece and p.piece.active):
+                continue
+
+            piece_blocks = p.piece.get_absolute_blocks()
+            # Primary hit: exact cell
+            if (x, y) in piece_blocks:
+                hit = True
+            else:
+                # Secondary hit: current velocity prediction and adjacent cells
+                predicted = (p.piece.x + p.directionX, p.piece.y + p.directionY)
+                hit = (x, y) == predicted
+                if not hit:
+                    for bx, by in piece_blocks:
+                        if abs(bx - x) <= 1 and abs(by - y) <= 1:
+                            hit = True
+                            break
+
+            if hit:
+                p.piece.active = False
+                p.piece = None
+                p.respawn_time = time.time() + self.respawn_delay
+                p.score += 1
+                print(f"Player {p.id} cube hit at ({x},{y})! Score: {p.score}")
+                return True
+
+        return False
+
+    def process_board_touch_queue(self):
+        while self.board_touch_queue:
+            x, y = self.board_touch_queue.popleft()
+            self.handle_board_click(x, y)
+
+    def draw_glyph(self, buffer, key, ox, oy, color):
+        if key not in FONT: return
+        for dx, dy in FONT[key]:
+            self.set_led(buffer, ox + dx, oy + dy, color)
+
+    def render(self):
+        buffer = bytearray(FRAME_DATA_LENGTH)
+
+        if self.state == 'LOBBY':
+            # Pulse Separator
+            if int(time.time() * 2) % 2 == 0:
+                for x in range(16):
+                    self.set_led(buffer, x, 28, WHITE)
+            return buffer
+
+        if self.state == 'STARTUP':
+            step = self.startup_step
+            # Players Appearance
+            # for p in self.players:
+            #     if step > p.id:
+            #         self.draw_player_controls(buffer, p, p.id * 4)
+
+            # if step >= 4:
+            #     for x in range(16): self.set_led(buffer, x, 28, WHITE)
+
+            if 5 <= step <= 9:
+                num = 5 - (step - 5)
+                self.draw_glyph(buffer, num, 6, 10, WHITE)
+            return buffer
+
+        if self.state == 'GAMEOVER':
+            flash_on = (self.winner_flash_count % 2 == 0)
+            winner_color = self.winner_player.color if self.winner_player else RED
+            text_color = winner_color if flash_on else BLACK
+
+            if self.winner_flash_count >= 10: text_color = winner_color
+
+            self.draw_glyph(buffer, 'W', 1, 10, text_color)
+            self.draw_glyph(buffer, 'I', 7, 10, text_color)
+            self.draw_glyph(buffer, 'N', 11, 10, text_color)
+
+            # for p in self.players:
+            #     self.draw_player_controls(buffer, p, p.id * 4)
+            return buffer
+
+        if self.state == 'PLAYING':
+            with self.lock:
+                flash_color = WHITE
+                if self.scoring_player: flash_color = self.scoring_player.color
+
+                # Stamp current cube positions into trail at full brightness
+                for p in self.players:
+                    if p.piece and p.piece.active:
+                        for bx, by in p.piece.get_absolute_blocks():
+                            if 0 <= by < BOARD_HEIGHT and 0 <= bx < BOARD_WIDTH:
+                                self.trail[by][bx] = 1.0
+                                self.trail_color[by][bx] = p.piece.color
+
+                for y in range(BOARD_HEIGHT):
+                    for x in range(BOARD_WIDTH):
+                        color = self.board[y][x]
+                        if y in self.flashing_lines: color = flash_color
+
+                        # Draw trail (faded color) if no board block
+                        if color == BLACK and self.trail[y][x] > 0.05:
+                            tc = self.trail_color[y][x]
+                            t = self.trail[y][x]
+                            color = (int(tc[0] * t), int(tc[1] * t), int(tc[2] * t))
+
+                        self.set_led(buffer, x, y, color)
+
+                # Active Pieces (drawn on top of trail)
+                for p in self.players:
+                    if p.piece and p.piece.active:
+                        for bx, by in p.piece.get_absolute_blocks():
+                            if 0 <= by < BOARD_HEIGHT and 0 <= bx < BOARD_WIDTH:
+                                self.set_led(buffer, bx, by, p.piece.color)
+
+                # Decay trail for next frame
+                for y in range(BOARD_HEIGHT):
+                    for x in range(BOARD_WIDTH):
+                        self.trail[y][x] *= self.trail_decay
+
+            for x in range(16): self.set_led(buffer, x, 28, WHITE)
+            # for p in self.players:
+            #     self.draw_player_controls(buffer, p, p.id * 4)
+
+            return buffer
+
+    def set_led(self, buffer, x, y, color):
+        if x < 0 or x >= 16: return
+        channel = y // 4
+        if channel >= 8: return
+        row_in_channel = y % 4
+        if row_in_channel % 2 == 0:
+            led_index = row_in_channel * 16 + x
+        else:
+            led_index = row_in_channel * 16 + (15 - x)
+        block_size = NUM_CHANNELS * 3
+        offset = led_index * block_size + channel
+        if offset + NUM_CHANNELS * 2 < len(buffer):
+            buffer[offset] = color[1]  # GREEN (Swap for hardware)
+            buffer[offset + NUM_CHANNELS] = color[0]  # RED (Swap for hardware)
+            buffer[offset + NUM_CHANNELS * 2] = color[2]
 
 class NetworkManager:
     def __init__(self, game):
@@ -353,14 +710,33 @@ class NetworkManager:
             try:
                 data, _ = self.sock_recv.recvfrom(2048)
                 if len(data) >= 1373 and data[0] == 0x88:
+                    # Read board touch data from channels 0-6 (rows 0-27)
+                    for channel in range(7):
+                        ch_offset = 2 + (channel * 171) + 1
+                        ch_data = data[ch_offset: ch_offset + 170]
+                        for led_idx in range(min(64, len(ch_data))):
+                            is_pressed = (ch_data[led_idx] == 0xCC)
+                            # Convert led_idx to board (x, y) using same mapping as set_led
+                            row_in_channel = led_idx // 16
+                            col_raw = led_idx % 16
+                            if row_in_channel % 2 == 0:
+                                x = col_raw
+                            else:
+                                x = 15 - col_raw
+                            y = channel * 4 + row_in_channel
+                            if 0 <= x < BOARD_WIDTH and 0 <= y < BOARD_HEIGHT:
+                                # apply hits immediately on fresh board press for minimal lag
+                                if is_pressed and not self.game.board_pressed[y][x]:
+                                    with self.game.lock:
+                                        self.game.board_touch_queue.append((x, y))
+                                self.game.board_pressed[y][x] = is_pressed
+
+                    # Read input area (channel 7) for button states
                     offset = 2 + (7 * 171) + 1
                     ch8_data = data[offset: offset + 170]
                     for led_idx, val in enumerate(ch8_data):
                         if led_idx >= 64: break
                         is_pressed = (val == 0xCC)
-
-                        # Sync state to game active list
-                        # Logic now handled in Game.tick() -> process_inputs()
                         self.game.button_states[led_idx] = is_pressed
 
             except Exception:
@@ -399,12 +775,12 @@ if __name__ == "__main__":
                 game.running = False
                 break
             elif cmd.startswith('start'):
-                try:
+                # try:
                     num = int(cmd.split()[1])
                     game.start_game(num)
                     print(f"Started game with {num} players.")
-                except:
-                    print("Usage: start <num_players>")
+                # except:
+                #     print("Usage: start <num_players>")
             elif cmd == 'restart':
                 game.restart_round()
                 print("Restarted round.")
