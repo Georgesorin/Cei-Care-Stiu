@@ -102,12 +102,14 @@ FONT = {
     'B': [(0,0),(1,0),(0,1),(2,1),(0,2),(1,2),(0,3),(2,3),(0,4),(1,4)],
     'V': [(0,0),(2,0),(0,1),(2,1),(0,2),(2,2),(1,3),(1,4)],
     'S': [(0,0),(1,0),(2,0),(0,1),(0,2),(1,2),(2,2),(2,3),(0,4),(1,4),(2,4)],
+    'E': [(0,0),(1,0),(2,0),(0,1),(0,2),(1,2),(0,3),(0,4),(1,4),(2,4)],
+    'D': [(0,0),(1,0),(0,1),(2,1),(0,2),(2,2),(0,3),(2,3),(0,4),(1,4)],
 }
 
 # --- Battle Blaster Game Constants ---
 GAME_DURATION           = 300     # 5 minutes in seconds
-PROJECTILE_TICK_INTERVAL = 0.15   # seconds between projectile steps
-POWERUP_SPAWN_INTERVAL  = 10.0    # seconds between spawns
+PROJECTILE_TICK_INTERVAL = 0.075  # seconds between projectile steps (doubled speed)
+POWERUP_SPAWN_INTERVAL  = 4.0     # seconds between spawns
 POWERUP_LIFETIME        = 30.0    # seconds power-up stays on board
 POWERUP_EFFECT_DURATION = 15.0    # seconds collected effect lasts
 MAX_POWERUPS_ON_BOARD   = 3
@@ -144,14 +146,19 @@ def global_btn_idx(y, col):
     return channel * 64 + local_idx
 
 # Power-up types
-PTYPE_SPEED  = 1   # Yellow  — 2× projectile speed for 15s
-PTYPE_RAPID  = 2   # Green   — single tap fires for 15s
-PTYPE_DOUBLE = 3   # Magenta — fire 2 projectiles (col±1) for 15s
+PTYPE_SPEED   = 1   # Yellow  — 2× projectile speed for 15s
+PTYPE_RAPID   = 2   # Green   — single tap fires for 15s
+PTYPE_DOUBLE  = 3   # Magenta — fire 2 projectiles (col±1) for 15s
+PTYPE_ULTIMATE = 4  # Red 1×1 — unblockable 3-point shot
+
+VIOLET   = (148, 0, 211)
+DARK_RED = (139, 0,   0)
 
 PTYPE_COLORS = {
-    PTYPE_SPEED:  YELLOW,
-    PTYPE_RAPID:  GREEN,
-    PTYPE_DOUBLE: MAGENTA,
+    PTYPE_SPEED:    YELLOW,
+    PTYPE_RAPID:    GREEN,
+    PTYPE_DOUBLE:   MAGENTA,
+    PTYPE_ULTIMATE: RED,
 }
 
 
@@ -203,12 +210,26 @@ class SoundManager:
                 except:
                     print(f"Failed to load {path}")
 
-        if os.path.exists("_sfx/bgm.wav"):
+        BGM_PATH = r"C:\Users\rnech\Desktop\hackaton\Cei-Care-Stiu\Example\_sfx\Lady Gaga - Judas (Lyrics) - bemu (128k).wav"
+        if not os.path.exists(BGM_PATH):
+            BGM_PATH = "_sfx/bgm.wav"   # fallback to default
+        if os.path.exists(BGM_PATH):
             try:
-                pygame.mixer.music.load("_sfx/bgm.wav")
-                pygame.mixer.music.set_volume(0.5)
-            except:
-                print("Failed to load BGM")
+                pygame.mixer.music.load(BGM_PATH)
+                pygame.mixer.music.set_volume(0.6)
+                print(f"BGM loaded OK: {BGM_PATH}")
+            except Exception as e:
+                print(f"Failed to load BGM as WAV ({e}), trying as MP3...")
+                try:
+                    mp3_path = BGM_PATH.replace(".wav", ".mp3")
+                    # Try loading the .wav path directly via pygame (it handles mp3 too)
+                    pygame.mixer.music.load(BGM_PATH)
+                    pygame.mixer.music.set_volume(0.6)
+                    print("BGM loaded OK as MP3")
+                except Exception as e2:
+                    print(f"BGM load failed entirely: {e2}")
+        else:
+            print(f"BGM file not found: {BGM_PATH}")
 
     def play(self, name):
         if not self.enabled: return
@@ -219,9 +240,11 @@ class SoundManager:
     def start_bgm(self):
         if not self.enabled: return
         try:
-            if not pygame.mixer.music.get_busy():
-                pygame.mixer.music.play(-1)
-        except: pass
+            pygame.mixer.music.stop()
+            pygame.mixer.music.play(-1)
+            print("BGM playback started.")
+        except Exception as e:
+            print(f"BGM play failed: {e}")
 
     def stop_bgm(self):
         if not self.enabled: return
@@ -236,12 +259,16 @@ class SoundManager:
 class Projectile:
     TRAIL_LENGTH = 4
 
-    def __init__(self, x, y, team_id):
+    def __init__(self, x, y, team_id, unblockable=False, points=1, shape='normal'):
         self.x = x
         self.y = y
-        self.team_id = team_id   # 'A' or 'B'
-        self.active = True
-        self.trail = []   # list of (x, y) — oldest first
+        self.team_id     = team_id      # 'A' or 'B'
+        self.active      = True
+        self.trail       = []           # list of (x, y) — oldest first
+        self.unblockable = unblockable
+        self.points      = points
+        self.shape       = shape        # 'normal' | 'sphere' | 'slash'
+        self.created_at  = time.time()
 
 
 class PowerUp:
@@ -316,7 +343,10 @@ class BattleGame:
         self.startup_timer      = time.time()
         self.game_over_timer    = 0.0
         self.game_start_time    = 0.0
+        self.winner             = None   # 'A', 'B', or 'TIE'
         self.last_console_print = 0.0   # for throttled time-remaining prints
+
+        self.sound.start_bgm()
 
     # -----------------------------------------------------------------------
     # Game lifecycle
@@ -368,7 +398,17 @@ class BattleGame:
 
             # 5-minute time limit
             if elapsed >= GAME_DURATION:
-                print("TIME'S UP! Game over.")
+                sa = self.teams['A'].score
+                sb = self.teams['B'].score
+                if sa > sb:
+                    self.winner = 'A'
+                    print(f"TIME'S UP! Team A wins {sa}-{sb}!")
+                elif sb > sa:
+                    self.winner = 'B'
+                    print(f"TIME'S UP! Team B wins {sb}-{sa}!")
+                else:
+                    self.winner = 'TIE'
+                    print(f"TIME'S UP! It's a tie {sa}-{sb}!")
                 self.state           = 'GAMEOVER'
                 self.game_over_timer = now
                 self.sound.play('gameover')
@@ -392,7 +432,8 @@ class BattleGame:
                 if pu.active and (now - pu.created_time) < POWERUP_LIFETIME
             ]
             # Expire finished explosions and ripples
-            self.explosions = [e for e in self.explosions if now - e['start'] < 0.45]
+            self.explosions = [e for e in self.explosions
+                               if now - e['start'] < (1.2 if e.get('ultimate') else 0.55 if e.get('big') else 0.45)]
             self.ripples    = [r for r in self.ripples    if now - r['start'] < 0.60]
 
     def _lobby_check_start(self):
@@ -423,20 +464,10 @@ class BattleGame:
 
     def _tick_gameover(self):
         now = time.time()
-        # Blink "TIME" on the board every 0.5s
-        if now - self.game_over_timer > 0.5:
-            self.game_over_timer = now
-
-        # Allow restart via any button press after 3 seconds of GAMEOVER
-        if now - self.game_over_timer > 3.0:
-            for i in range(BUTTON_STATES_SIZE):
-                if self.button_states[i] and not self.prev_button_states[i]:
-                    for j in range(BUTTON_STATES_SIZE):
-                        self.prev_button_states[j] = self.button_states[j]
-                    self.restart_round()
-                    return
-        for i in range(BUTTON_STATES_SIZE):
-            self.prev_button_states[i] = self.button_states[i]
+        # 3s spread + 2s END text = 5s total, then exit
+        if now - self.game_over_timer >= 5.0:
+            print("Game over — exiting.")
+            os._exit(0)
 
     # -----------------------------------------------------------------------
     # Input processing — double-press state machine
@@ -538,9 +569,19 @@ class BattleGame:
                 # Cross-collision: check if the destination cell holds an opposing projectile
                 next_y = proj.y + team.direction
                 for opp in self.projectiles:
-                    if opp.active and opp.team_id != team_id and opp.x == proj.x and opp.y == next_y:
+                    if opp.active and opp.team_id != team_id and opp.x == proj.x and opp.y == next_y \
+                            and not proj.unblockable and not opp.unblockable:
                         proj.active = False
                         opp.active = False
+                        # Big explosion at the midpoint between the two projectiles
+                        mid_y = (proj.y + opp.y) // 2
+                        self.explosions.append({
+                            'x': proj.x - 1, 'y': mid_y - 1,
+                            'color': VIOLET,
+                            'start': time.time(),
+                            'big': True,
+                        })
+                        self.sound.play('tetris')
                         break
                 if not proj.active:
                     continue
@@ -550,9 +591,10 @@ class BattleGame:
                     proj.trail.pop(0)
                 proj.y += team.direction
 
-                # Check power-up collection — projectile overlaps any cell of the 2×2 block
+                # Check power-up collection — ULTIMATE is 1×1, others are 2×2
                 for pu in self.power_ups:
-                    if pu.active and pu.x <= proj.x <= pu.x + 1 and pu.y <= proj.y <= pu.y + 1:
+                    size = 0 if pu.ptype == PTYPE_ULTIMATE else 1
+                    if pu.active and pu.x <= proj.x <= pu.x + size and pu.y <= proj.y <= pu.y + size:
                         self._apply_powerup(team_id, pu.ptype)
                         self.explosions.append({
                             'x': pu.x, 'y': pu.y,
@@ -568,14 +610,20 @@ class BattleGame:
                 # Team B shoots up  → scores when proj.y <= TEAM_A_BASE_ROW (0)
                 if team_id == 'A' and proj.y >= TEAM_B_BASE_ROW:
                     proj.active = False
-                    self.teams['A'].score += 1
-                    self.ripples.append({'x': proj.x, 'y': TEAM_B_BASE_ROW, 'color': RED,  'start': time.time()})
+                    self.teams['A'].score += proj.points
+                    self.ripples.append({'x': proj.x, 'y': TEAM_B_BASE_ROW, 'color': RED, 'start': time.time()})
+                    if proj.points >= 3:
+                        self.explosions.append({'x': proj.x, 'y': TEAM_B_BASE_ROW,
+                                                'color': DARK_RED, 'start': time.time(), 'ultimate': True})
                     print(f"SCORE — Team A: {self.teams['A'].score}  Team B: {self.teams['B'].score}")
                     self.sound.play('line')
                 elif team_id == 'B' and proj.y <= TEAM_A_BASE_ROW:
                     proj.active = False
-                    self.teams['B'].score += 1
+                    self.teams['B'].score += proj.points
                     self.ripples.append({'x': proj.x, 'y': TEAM_A_BASE_ROW, 'color': BLUE, 'start': time.time()})
+                    if proj.points >= 3:
+                        self.explosions.append({'x': proj.x, 'y': TEAM_A_BASE_ROW,
+                                                'color': VIOLET, 'start': time.time(), 'ultimate': True})
                     print(f"SCORE — Team A: {self.teams['A'].score}  Team B: {self.teams['B'].score}")
                     self.sound.play('line')
                 elif proj.y < 0 or proj.y >= BOARD_HEIGHT:
@@ -602,6 +650,8 @@ class BattleGame:
 
         for key in pos_a:
             if key in pos_b:
+                if pos_a[key].unblockable or pos_b[key].unblockable:
+                    continue  # unblockable passes through
                 pos_a[key].active = False
                 pos_b[key].active = False
 
@@ -636,9 +686,11 @@ class BattleGame:
             y = random.randint(POWERUP_SPAWN_ROW_MIN, POWERUP_SPAWN_ROW_MAX - 1)  # leave room for y+1
             if (x, y) not in occupied and (x+1, y) not in occupied and \
                (x, y+1) not in occupied and (x+1, y+1) not in occupied:
-                ptype = random.choice([PTYPE_SPEED, PTYPE_RAPID, PTYPE_DOUBLE])
+                ptype = random.choice([PTYPE_SPEED, PTYPE_RAPID, PTYPE_DOUBLE,
+                                       PTYPE_ULTIMATE, PTYPE_ULTIMATE])  # weighted slightly
                 self.power_ups.append(PowerUp(x, y, ptype))
-                names = {PTYPE_SPEED: 'SPEED', PTYPE_RAPID: 'RAPID', PTYPE_DOUBLE: 'DOUBLE'}
+                names = {PTYPE_SPEED: 'SPEED', PTYPE_RAPID: 'RAPID',
+                         PTYPE_DOUBLE: 'DOUBLE', PTYPE_ULTIMATE: 'ULTIMATE'}
                 print(f"Power-up spawned: {names[ptype]} at ({x},{y})")
                 break
 
@@ -655,6 +707,16 @@ class BattleGame:
         elif ptype == PTYPE_DOUBLE:
             team.effect_double_until = expiry
             print(f"Team {team_id} got DOUBLE SHOT!")
+        elif ptype == PTYPE_ULTIMATE:
+            # Fire one unblockable 3-point projectile immediately from the centre
+            cx = BOARD_WIDTH // 2
+            if team_id == 'B':
+                shape = 'sphere'
+                p = Projectile(cx, LAUNCHER_ROW_B, 'B', unblockable=True, points=3, shape='sphere')
+            else:
+                p = Projectile(cx, LAUNCHER_ROW_A, 'A', unblockable=True, points=3, shape='parabola')
+            self.projectiles.append(p)
+            print(f"Team {team_id} fired ULTIMATE!")
 
     def _expire_effects(self):
         now = time.time()
@@ -748,42 +810,155 @@ class BattleGame:
         # ---------- STARTUP ----------
         if self.state == 'STARTUP':
             step = self.startup_step
-            # Base rows always visible
+
+            # Compute total elapsed since startup began
+            if step < 5:
+                total_elapsed = step * 0.2 + (now - self.startup_timer)
+            else:
+                total_elapsed = 1.0 + (step - 5) * 1.0 + (now - self.startup_timer)
+
+            # ── Step 9 (1 second left): return board to normal ──
+            if step >= 9:
+                for x in range(BOARD_WIDTH):
+                    self.set_led(buffer, x, TEAM_A_BASE_ROW, RED)
+                    self.set_led(buffer, x, TEAM_B_BASE_ROW, BLUE)
+                    self.set_led(buffer, x, LAUNCHER_ROW_A, DIM_RED)
+                    self.set_led(buffer, x, LAUNCHER_ROW_B, DIM_BLUE)
+                self.draw_glyph(buffer, 1, 6, 13, WHITE)
+                return buffer
+
+            # ── Full-board anime animation ──
+            MID    = BOARD_HEIGHT // 2          # row 16
+            speed  = total_elapsed * 14         # scroll speed
+
+            # Background energy waves — red top half, blue bottom half
+            for y in range(BOARD_HEIGHT):
+                for x in range(BOARD_WIDTH):
+                    if y < MID:
+                        band = int(y * 2 + speed) % 12
+                        fac  = max(0.12, 1.0 - abs(band - 6) / 6.0)
+                        # column shimmer
+                        cfac = max(0.4, 1.0 - ((x + int(speed * 0.5)) % 5) * 0.12)
+                        self.set_led(buffer, x, y, (int(210 * fac * cfac), 0, 0))
+                    else:
+                        band = int((BOARD_HEIGHT - 1 - y) * 2 + speed) % 12
+                        fac  = max(0.12, 1.0 - abs(band - 6) / 6.0)
+                        cfac = max(0.4, 1.0 - ((x + int(speed * 0.5)) % 5) * 0.12)
+                        self.set_led(buffer, x, y, (0, 0, int(210 * fac * cfac)))
+
+            # Vertical energy beams erupting from each base
+            for x in range(BOARD_WIDTH):
+                # Red beams from row 0 downward
+                phase_r = int(x * 3 + speed * 0.8) % 9
+                if phase_r < 4:
+                    beam_len = 5 + phase_r * 2
+                    for y in range(min(beam_len, MID)):
+                        fac = max(0.0, 1.0 - y / max(1, beam_len))
+                        self.set_led(buffer, x, y,
+                                     (int(255 * fac), int(60 * fac), 0))
+                # Blue beams from row 31 upward
+                phase_b = int(x * 5 + speed * 1.1) % 9
+                if phase_b < 4:
+                    beam_len = 5 + phase_b * 2
+                    for y in range(BOARD_HEIGHT - 1,
+                                   max(BOARD_HEIGHT - 1 - beam_len, MID - 1), -1):
+                        fac = max(0.0, 1.0 - (BOARD_HEIGHT - 1 - y) / max(1, beam_len))
+                        self.set_led(buffer, x, y,
+                                     (0, int(60 * fac), int(255 * fac)))
+
+            # Center clash band (rows MID-3 to MID+2)
+            clash_phase = int(total_elapsed * 6) % 3
+            for x in range(BOARD_WIDTH):
+                for y in range(MID - 3, MID + 3):
+                    dist = abs(y - MID)
+                    fac  = max(0.0, 1.0 - dist * 0.28)
+                    if clash_phase == 0:        # red-to-blue gradient
+                        rf = (MID - y + 3) / 6.0
+                        bf = (y - MID + 3) / 6.0
+                        self.set_led(buffer, x, y,
+                                     (int(255 * rf * fac), 0, int(255 * bf * fac)))
+                    elif clash_phase == 1:      # white flash
+                        self.set_led(buffer, x, y,
+                                     (int(255 * fac), int(255 * fac), int(255 * fac)))
+                    else:                       # purple surge
+                        self.set_led(buffer, x, y,
+                                     (int(180 * fac), 0, int(220 * fac)))
+
+            # Horizontal shockwave lines sweeping from centre outward
+            wave_y_r = MID - 1 - int(total_elapsed * 6) % MID   # red line sweeps up
+            wave_y_b = MID     + int(total_elapsed * 6) % MID   # blue line sweeps down
+            for x in range(BOARD_WIDTH):
+                self.set_led(buffer, x, max(0, wave_y_r), WHITE)
+                self.set_led(buffer, x, min(BOARD_HEIGHT-1, wave_y_b), WHITE)
+
+            # Base rows always bright
             for x in range(BOARD_WIDTH):
                 self.set_led(buffer, x, TEAM_A_BASE_ROW, RED)
                 self.set_led(buffer, x, TEAM_B_BASE_ROW, BLUE)
-            # Launcher bars dim
-            for x in range(BOARD_WIDTH):
-                self.set_led(buffer, x, LAUNCHER_ROW_A, DIM_RED)
-                self.set_led(buffer, x, LAUNCHER_ROW_B, DIM_BLUE)
-            # Countdown digits centred in neutral zone (steps 5-9: 5,4,3,2,1)
-            if 5 <= step <= 9:
+
+            # Countdown number (steps 5-8 → digits 5,4,3,2)
+            if 5 <= step <= 8:
                 num = 5 - (step - 5)
-                self.draw_glyph(buffer, num, 6, 13, WHITE)
+                step_prog = now - self.startup_timer
+                text_c = WHITE if step_prog < 0.12 else (200, 200, 200)
+                self.draw_glyph(buffer, num, 6, 13, text_c)
+
             return buffer
 
         # ---------- GAMEOVER ----------
         if self.state == 'GAMEOVER':
-            # Flash "TIME" — alternate between white and dim grey
-            flash_on   = int((now - self.game_over_timer) * 2) % 2 == 0
-            text_color = WHITE if flash_on else (40, 40, 40)
+            elapsed_go = now - self.game_over_timer
 
-            # "TIME" spelled across the board centre
-            # T-I-M-E each 3 wide + 1 gap = 15 columns, starting at x=0
-            # Draw as individual letters using FONT glyphs
-            # We'll use I, N glyph pieces to approximate — or use raw pixels
-            # Simple: draw the word TIME as coloured rows
-            # Use available FONT glyphs: reuse digit shapes for letters
-            # Row 12-16 for text area
-            self.draw_glyph(buffer, 'I',  0, 13, text_color)   # T (approximate with I)
-            self.draw_glyph(buffer, 'I',  4, 13, text_color)
-            self.draw_glyph(buffer, 'I',  8, 13, text_color)
-            self.draw_glyph(buffer, 'N', 12, 13, text_color)
+            # Determine winner color(s)
+            if self.winner == 'A':
+                win_color = RED
+                spread_from_top = True   # A is at top (row 0), spreads downward
+            elif self.winner == 'B':
+                win_color = BLUE
+                spread_from_top = False  # B is at bottom (row 31), spreads upward
+            else:
+                win_color = WHITE        # TIE — white flood from both ends
+                spread_from_top = True
 
-            # Base rows dim
-            for x in range(BOARD_WIDTH):
-                self.set_led(buffer, x, TEAM_A_BASE_ROW, DIM_RED)
-                self.set_led(buffer, x, TEAM_B_BASE_ROW, DIM_BLUE)
+            # --- Phase 1: color flood (0 – 3 s) ---
+            SPREAD_DURATION = 3.0
+            spread_t = min(elapsed_go / SPREAD_DURATION, 1.0)
+            rows_filled = int(spread_t * BOARD_HEIGHT)
+
+            if self.winner == 'TIE':
+                # Both sides flood toward the middle
+                half = rows_filled // 2 + 1
+                for x in range(BOARD_WIDTH):
+                    for row in range(min(half, BOARD_HEIGHT // 2)):
+                        self.set_led(buffer, x, row, RED)
+                    for row in range(BOARD_HEIGHT - 1, max(BOARD_HEIGHT - half - 1, BOARD_HEIGHT // 2 - 1), -1):
+                        self.set_led(buffer, x, row, BLUE)
+            elif spread_from_top:
+                # Flood from row 0 downward
+                for x in range(BOARD_WIDTH):
+                    for row in range(min(rows_filled + 1, BOARD_HEIGHT)):
+                        # Slight brightness gradient — leading edge brighter
+                        depth = (rows_filled - row)
+                        factor = max(0.4, 1.0 - depth * 0.04)
+                        c = tuple(int(ch * factor) for ch in win_color)
+                        self.set_led(buffer, x, row, c)
+            else:
+                # Flood from row 31 upward
+                for x in range(BOARD_WIDTH):
+                    for row in range(BOARD_HEIGHT - 1, max(BOARD_HEIGHT - rows_filled - 2, -1), -1):
+                        depth = (row - (BOARD_HEIGHT - rows_filled - 1))
+                        factor = max(0.4, 1.0 - depth * 0.04)
+                        c = tuple(int(ch * factor) for ch in win_color)
+                        self.set_led(buffer, x, row, c)
+
+            # --- Phase 2: "END" text appears after spread completes (>= 3 s) ---
+            if elapsed_go >= SPREAD_DURATION:
+                flash_on   = int((elapsed_go - SPREAD_DURATION) * 2) % 2 == 0
+                text_color = WHITE if flash_on else (50, 50, 50)
+                self.draw_glyph(buffer, 'E',  2, 14, text_color)
+                self.draw_glyph(buffer, 'N',  6, 14, text_color)
+                self.draw_glyph(buffer, 'D', 10, 14, text_color)
+
             return buffer
 
         # ---------- PLAYING ----------
@@ -794,7 +969,7 @@ class BattleGame:
                     self.set_led(buffer, x, TEAM_A_BASE_ROW, RED)
                     self.set_led(buffer, x, TEAM_B_BASE_ROW, BLUE)
 
-                # 2. Draw power-ups in neutral zone (2×2 blocks)
+                # 2. Draw power-ups in neutral zone (ULTIMATE=1×1, others=2×2)
                 for pu in self.power_ups:
                     if not pu.active:
                         continue
@@ -802,42 +977,401 @@ class BattleGame:
                     if remaining < 5.0 and int(now * 4) % 2 == 0:
                         continue  # blink off near expiry
                     color = PTYPE_COLORS[pu.ptype]
-                    for dx in range(2):
-                        for dy in range(2):
-                            self.set_led(buffer, pu.x + dx, pu.y + dy, color)
+                    if pu.ptype == PTYPE_ULTIMATE:
+                        self.set_led(buffer, pu.x, pu.y, color)
+                    else:
+                        for dx in range(2):
+                            for dy in range(2):
+                                self.set_led(buffer, pu.x + dx, pu.y + dy, color)
 
                 # 2b. Draw explosion animations
                 for exp in self.explosions:
-                    elapsed = now - exp['start']
-                    cx, cy  = exp['x'], exp['y']
-                    if elapsed < 0.15:
-                        # Frame 1: 2×2 white flash
-                        for dx in range(2):
-                            for dy in range(2):
-                                self.set_led(buffer, cx + dx, cy + dy, WHITE)
-                    elif elapsed < 0.30:
-                        # Frame 2: 4×4 ring in power-up color
-                        for dx in range(-1, 3):
-                            for dy in range(-1, 3):
-                                self.set_led(buffer, cx + dx, cy + dy, exp['color'])
+                    elapsed  = now - exp['start']
+                    cx, cy   = exp['x'], exp['y']
+                    big      = exp.get('big', False)
+                    ultimate = exp.get('ultimate', False)
+                    ec       = exp['color']
+
+                    if ultimate:
+                        # ── ULTIMATE IMPACT ── massive 5-frame anime shockwave
+                        GOLD = (255, 220, 0)
+                        DIM_EC = tuple(c // 3 for c in ec)
+                        if elapsed < 0.08:
+                            # F1: full-board white flash
+                            for x in range(BOARD_WIDTH):
+                                for y in range(BOARD_HEIGHT):
+                                    self.set_led(buffer, x, y, WHITE)
+                        elif elapsed < 0.22:
+                            # F2: 10×10 white core + gold ring
+                            for dx in range(-5, 6):
+                                for dy in range(-5, 6):
+                                    dist = abs(dx) + abs(dy)
+                                    if dist <= 3:
+                                        self.set_led(buffer, cx+dx, cy+dy, WHITE)
+                                    elif dist <= 7:
+                                        self.set_led(buffer, cx+dx, cy+dy, GOLD)
+                                    elif dist <= 9:
+                                        self.set_led(buffer, cx+dx, cy+dy, ec)
+                        elif elapsed < 0.42:
+                            # F3: expanding shockwave ring (thin bright ring at growing radius)
+                            radius = int((elapsed - 0.22) / 0.20 * 7) + 4
+                            for dx in range(-radius-1, radius+2):
+                                for dy in range(-radius-1, radius+2):
+                                    dist = abs(dx) + abs(dy)
+                                    if radius - 1 <= dist <= radius + 1:
+                                        fac = 1.0 - abs(dist - radius) * 0.5
+                                        c = tuple(int(ch * fac) for ch in ec)
+                                        self.set_led(buffer, cx+dx, cy+dy, c)
+                            # Cross beams
+                            for d in range(-6, 7):
+                                self.set_led(buffer, cx+d, cy,   GOLD)
+                                self.set_led(buffer, cx,   cy+d, GOLD)
+                        elif elapsed < 0.75:
+                            # F4: scattered sparks + large cross
+                            fac = max(0.0, 1.0 - (elapsed - 0.42) / 0.33)
+                            spark_c = tuple(int(ch * fac) for ch in ec)
+                            gold_c  = tuple(int(ch * fac) for ch in GOLD)
+                            for d in range(-7, 8):
+                                self.set_led(buffer, cx+d, cy,   gold_c)
+                                self.set_led(buffer, cx,   cy+d, gold_c)
+                            # diagonal sparks
+                            for d in range(-5, 6):
+                                self.set_led(buffer, cx+d, cy+d, spark_c)
+                                self.set_led(buffer, cx+d, cy-d, spark_c)
+                        else:
+                            # F5: dim embers fade out
+                            fac = max(0.0, 1.0 - (elapsed - 0.75) / 0.45)
+                            ember = tuple(int(ch * fac * 0.4) for ch in ec)
+                            for d in range(-8, 9):
+                                self.set_led(buffer, cx+d, cy,   ember)
+                                self.set_led(buffer, cx,   cy+d, ember)
+                            for d in range(-6, 7):
+                                self.set_led(buffer, cx+d, cy+d, ember)
+                                self.set_led(buffer, cx+d, cy-d, ember)
+
+                    elif big:
+                        # ── ANIME CLASH EXPLOSION ── purple shockwave
+                        PB = (220, 0, 255)   # bright
+                        PM = (148, 0, 211)   # mid
+                        PD = ( 60, 0,  80)   # dim
+                        if elapsed < 0.07:
+                            # F1: pure white full-board flash
+                            for x in range(BOARD_WIDTH):
+                                for y in range(max(0,cy-5), min(BOARD_HEIGHT,cy+6)):
+                                    self.set_led(buffer, x, y, WHITE)
+                        elif elapsed < 0.17:
+                            # F2: white core + bright purple diamond ring
+                            for dx in range(-6, 7):
+                                for dy in range(-6, 7):
+                                    dist = abs(dx) + abs(dy)
+                                    if dist <= 2:   self.set_led(buffer, cx+dx, cy+dy, WHITE)
+                                    elif dist <= 5: self.set_led(buffer, cx+dx, cy+dy, PB)
+                                    elif dist <= 8: self.set_led(buffer, cx+dx, cy+dy, PM)
+                        elif elapsed < 0.30:
+                            # F3: 8-directional energy beams
+                            fac = 1.0 - (elapsed - 0.17) / 0.13
+                            for d in range(1, 8):
+                                bc = tuple(int(c * fac * max(0.2, 1.0 - d*0.12)) for c in PB)
+                                self.set_led(buffer, cx+d,  cy,   bc)
+                                self.set_led(buffer, cx-d,  cy,   bc)
+                                self.set_led(buffer, cx,    cy+d, bc)
+                                self.set_led(buffer, cx,    cy-d, bc)
+                                self.set_led(buffer, cx+d,  cy+d, tuple(c//2 for c in bc))
+                                self.set_led(buffer, cx-d,  cy+d, tuple(c//2 for c in bc))
+                                self.set_led(buffer, cx+d,  cy-d, tuple(c//2 for c in bc))
+                                self.set_led(buffer, cx-d,  cy-d, tuple(c//2 for c in bc))
+                        else:
+                            # F4: fading purple ember cross + diagonals
+                            fac = max(0.0, 1.0 - (elapsed - 0.30) / 0.25)
+                            for d in range(-7, 8):
+                                self.set_led(buffer, cx+d, cy,   tuple(int(c*fac) for c in PD))
+                                self.set_led(buffer, cx,   cy+d, tuple(int(c*fac) for c in PD))
+                            for d in range(-5, 6):
+                                self.set_led(buffer, cx+d, cy+d, tuple(int(c*fac*0.5) for c in PM))
+                                self.set_led(buffer, cx+d, cy-d, tuple(int(c*fac*0.5) for c in PM))
                     else:
-                        # Frame 3: 6×6 dim fade-out
-                        dim = tuple(c // 4 for c in exp['color'])
-                        for dx in range(-2, 4):
-                            for dy in range(-2, 4):
-                                self.set_led(buffer, cx + dx, cy + dy, dim)
+                        if elapsed < 0.15:
+                            # Frame 1: 2×2 white flash
+                            for dx in range(2):
+                                for dy in range(2):
+                                    self.set_led(buffer, cx + dx, cy + dy, WHITE)
+                        elif elapsed < 0.30:
+                            # Frame 2: 4×4 ring in power-up color
+                            for dx in range(-1, 3):
+                                for dy in range(-1, 3):
+                                    self.set_led(buffer, cx + dx, cy + dy, exp['color'])
+                        else:
+                            # Frame 3: 6×6 dim fade-out
+                            dim = tuple(c // 4 for c in exp['color'])
+                            for dx in range(-2, 4):
+                                for dy in range(-2, 4):
+                                    self.set_led(buffer, cx + dx, cy + dy, dim)
 
                 # 3. Draw projectile trails then projectiles
                 for proj in self.projectiles:
                     if not proj.active:
                         continue
-                    color = self.teams[proj.team_id].color
-                    # Trail: oldest = dimmest, newest = brightest
-                    for i, (tx, ty) in enumerate(proj.trail):
-                        factor = (i + 1) / (Projectile.TRAIL_LENGTH + 1)
-                        tc = tuple(int(c * factor * 0.6) for c in color)
-                        self.set_led(buffer, tx, ty, tc)
-                    self.set_led(buffer, proj.x, proj.y, color)
+                    if proj.shape == 'sphere':
+                        # ══ DRAGON BALL ENERGY SPHERE ══
+                        pulse   = int(now * 16) % 2           # 8 Hz white flash
+                        t_rot_a = int(now * 8)  % 8           # inner ring  (CW)
+                        t_rot_b = int(now * 5)  % 8           # outer ring  (CCW)
+                        px, py  = proj.x, proj.y
+
+                        # --- Full-column energy wake: entire column behind, 14 rows ---
+                        for wy in range(py + 1, min(py + 14, BOARD_HEIGHT)):
+                            fac = max(0.0, 1.0 - (wy - py) * 0.075)
+                            wc = tuple(int(c * fac * 0.8) for c in VIOLET)
+                            for wx in range(px - 2, px + 3):
+                                cf = max(0.0, 1.0 - abs(wx - px) * 0.3)
+                                self.set_led(buffer, wx, wy, tuple(int(c * cf) for c in wc))
+
+                        # --- Horizontal speed flare at sphere row (full width) ---
+                        SPEED_FLARE = (40, 0, 60)
+                        for x in range(BOARD_WIDTH):
+                            fac = max(0.2, 1.0 - abs(x - px) * 0.08)
+                            fc = tuple(int(c * fac) for c in SPEED_FLARE)
+                            self.set_led(buffer, x, py, fc)
+                            self.set_led(buffer, x, py - 1, tuple(c // 2 for c in fc))
+                            self.set_led(buffer, x, py + 1, tuple(c // 2 for c in fc))
+
+                        # --- Ghost trail: full-sized ghost orbs ---
+                        for i, (tx, ty) in enumerate(proj.trail):
+                            factor = (i + 1) / (Projectile.TRAIL_LENGTH + 1)
+                            for ddx in range(-4, 5):
+                                for ddy in range(-4, 5):
+                                    dist = abs(ddx) + abs(ddy)
+                                    if dist > 8: continue
+                                    fac = factor * max(0.0, 1.0 - dist * 0.1) * 0.55
+                                    tc = tuple(int(c * fac) for c in VIOLET)
+                                    self.set_led(buffer, tx + ddx, ty + ddy, tc)
+
+                        # --- Concentric aura rings (large diamond) ---
+                        for ddx in range(-7, 8):
+                            for ddy in range(-7, 8):
+                                dist = abs(ddx) + abs(ddy)
+                                if   dist <= 2:  c = WHITE
+                                elif dist <= 4:  c = VIOLET
+                                elif dist <= 6:  c = (140, 0, 200)
+                                elif dist <= 8:  c = (80,  0, 120)
+                                elif dist <= 10: c = (40,  0,  60)
+                                elif dist <= 12: c = (15,  0,  25)
+                                else: continue
+                                self.set_led(buffer, px + ddx, py + ddy, c)
+
+                        # --- Inner 8 spokes at radius 4 (rotate CW) ---
+                        spokes_i = [(0,-4),(3,-3),(4,0),(3,3),(0,4),(-3,3),(-4,0),(-3,-3)]
+                        for si in range(8):
+                            sx, sy = spokes_i[(si + t_rot_a) % 8]
+                            bright = 1.0 if si % 2 == 0 else 0.5
+                            sc = tuple(int(c * bright) for c in (240, 100, 255))
+                            self.set_led(buffer, px + sx, py + sy, sc)
+
+                        # --- Outer 8 spokes at radius 6 (rotate CCW) ---
+                        spokes_o = [(0,-6),(4,-4),(6,0),(4,4),(0,6),(-4,4),(-6,0),(-4,-4)]
+                        for si in range(8):
+                            sx, sy = spokes_o[(si - t_rot_b) % 8]
+                            bright = 1.0 if si % 2 == 0 else 0.3
+                            sc = tuple(int(c * bright) for c in (200, 50, 255))
+                            self.set_led(buffer, px + sx, py + sy, sc)
+
+                        # --- Blazing white core cross ---
+                        core_c = WHITE if pulse else (240, 180, 255)
+                        for d in range(-2, 3):
+                            self.set_led(buffer, px + d, py,     core_c)
+                            self.set_led(buffer, px,     py + d, core_c)
+                        self.set_led(buffer, px, py, WHITE)
+
+                    elif proj.shape == 'slash':
+                        # ══ DEMON SLAYER SWORD SLASH ══
+                        flicker = int(now * 20) % 3           # 6.7 Hz 3-frame
+                        pulse   = int(now * 30) % 2           # fast tip flash
+                        px, py  = proj.x, proj.y
+
+                        # --- FULL-BOARD horizontal impact lines (5 rows each side) ---
+                        impact_rows = [(-1,1.0),(-2,0.75),(-3,0.45),(-4,0.22),(-5,0.08),
+                                       ( 1,1.0),( 2,0.75),( 3,0.45),( 4,0.22),( 5,0.08)]
+                        for row_off, alpha in impact_rows:
+                            ic = (int(180 * alpha), 0, 0)
+                            for x in range(BOARD_WIDTH):
+                                self.set_led(buffer, x, py + row_off, ic)
+
+                        # --- Full-height vertical ki column (entire board height above) ---
+                        for ky in range(py - 1, -1, -1):
+                            fac = max(0.0, 1.0 - (py - ky) * 0.065)
+                            kc  = tuple(int(c * fac * 0.85) for c in DARK_RED)
+                            for kx in range(px - 3, px + 4):
+                                cf = max(0.0, 1.0 - abs(kx - px) * 0.28)
+                                self.set_led(buffer, kx, ky, tuple(int(c * cf) for c in kc))
+
+                        # --- Ghost afterimages (large 9-cell diagonal) ---
+                        for i, (tx, ty) in enumerate(proj.trail):
+                            factor = (i + 1) / (Projectile.TRAIL_LENGTH + 1)
+                            tc = tuple(int(c * factor * 0.5) for c in DARK_RED)
+                            for d in range(-4, 5):
+                                self.set_led(buffer, tx + d, ty + d, tc)
+
+                        # --- 5 parallel diagonal lines for a thick blade ---
+                        # Offsets perpendicular to '\': shift x while keeping y same
+                        blade_layers = [
+                            (-2, (50,  0, 0)),   # far edge
+                            (-1, (100, 0, 0)),   # inner edge
+                            ( 0, DARK_RED),      # centre
+                            ( 1, (100, 0, 0)),   # inner edge
+                            ( 2, (50,  0, 0)),   # far edge
+                        ]
+                        for x_off, bc in blade_layers:
+                            for d in range(-5, 6):
+                                self.set_led(buffer, px + d + x_off, py + d, bc)
+
+                        # --- White/yellow/orange flickering hot core ---
+                        if flicker == 0:   core_c = WHITE
+                        elif flicker == 1: core_c = (255, 230, 0)
+                        else:              core_c = (255, 100, 0)
+                        for d in range(-3, 4):
+                            self.set_led(buffer, px + d, py + d, core_c)
+
+                        # --- Starburst at the leading tip ---
+                        tip_c = WHITE if pulse else (255, 240, 100)
+                        for ddx in range(-1, 2):
+                            for ddy in range(-1, 2):
+                                self.set_led(buffer, px + 5 + ddx, py + 5 + ddy, tip_c)
+                        self.set_led(buffer, px + 5, py + 5, WHITE)
+                        # Cross flare on tip
+                        for d in range(1, 4):
+                            fac = 1.0 - d * 0.3
+                            fc = tuple(int(c * fac) for c in (255, 200, 0))
+                            self.set_led(buffer, px + 5 + d, py + 5, fc)
+                            self.set_led(buffer, px + 5, py + 5 + d, fc)
+                            self.set_led(buffer, px + 5 - d, py + 5, fc)
+                            self.set_led(buffer, px + 5, py + 5 - d, fc)
+                    elif proj.shape == 'parabola':
+                        # ══ SHOCKWAVE PARABOLA — red energy wave ══
+                        flicker = int(now * 20) % 3
+                        pulse   = int(now * 30) % 2
+                        px, py  = proj.x, proj.y
+                        team    = self.teams[proj.team_id]
+                        COEFF   = 7   # lower = wider/shallower parabola
+
+                        # Pre-compute curve y for every board column
+                        curve = {}
+                        for x in range(BOARD_WIDTH):
+                            curve[x] = py - round((x - px) ** 2 / COEFF)
+
+                        # --- Dark red glow BELOW the parabola (energy wake behind the curve) ---
+                        for x in range(BOARD_WIDTH):
+                            cy_curve = curve[x]
+                            for gy in range(cy_curve + 1, min(BOARD_HEIGHT, cy_curve + 9)):
+                                fac = max(0.0, 1.0 - (gy - cy_curve) * 0.14)
+                                gc  = (int(120 * fac), 0, 0)
+                                self.set_led(buffer, x, gy, gc)
+
+                        # --- Full-width impact lines at the parabola spine rows ---
+                        for row_off, alpha in [(-1,0.8),(-2,0.5),(-3,0.25),(-4,0.1),
+                                               ( 1,0.8),( 2,0.5),( 3,0.25),( 4,0.1)]:
+                            ic = (int(160 * alpha), 0, 0)
+                            for x in range(BOARD_WIDTH):
+                                self.set_led(buffer, x, py + row_off, ic)
+
+                        # --- Ghost trail: fading parabola afterimages ---
+                        for i, (tx, ty) in enumerate(proj.trail):
+                            factor = (i + 1) / (Projectile.TRAIL_LENGTH + 1) * 0.45
+                            for x in range(BOARD_WIDTH):
+                                gy = ty - round((x - tx) ** 2 / COEFF)
+                                tc = (int(139 * factor), 0, 0)
+                                self.set_led(buffer, x, gy, tc)
+
+                        # --- Parabola curve: dark red outer, then hot core, glow pixels ---
+                        for x in range(BOARD_WIDTH):
+                            cy_c = curve[x]
+                            # Glow halo ±2 around curve
+                            for off, fac in [(-2,0.3),(-1,0.65),(0,1.0),(1,0.65),(2,0.3)]:
+                                self.set_led(buffer, x, cy_c + off, (int(139 * fac), 0, 0))
+                            # Hot core on curve
+                            if flicker == 0:   hot = WHITE
+                            elif flicker == 1: hot = (255, 200, 0)
+                            else:              hot = (255, 80,  0)
+                            self.set_led(buffer, x, cy_c, hot)
+
+                        # --- Blazing starburst at the center leading tip (px, py) ---
+                        tip_c = WHITE if pulse else (255, 230, 80)
+                        for ddx in range(-2, 3):
+                            for ddy in range(-2, 3):
+                                if abs(ddx) + abs(ddy) <= 2:
+                                    self.set_led(buffer, px + ddx, py + ddy, tip_c)
+                        for d in range(1, 5):
+                            fc = tuple(int(c * (1.0 - d*0.22)) for c in (255, 180, 0))
+                            self.set_led(buffer, px + d, py,     fc)
+                            self.set_led(buffer, px - d, py,     fc)
+                            self.set_led(buffer, px,     py - d, fc)
+                            self.set_led(buffer, px,     py + d, fc)
+
+                    else:
+                        # ══ ENERGY BEAM ══
+                        color  = self.teams[proj.team_id].color
+                        team   = self.teams[proj.team_id]
+                        direct = team.direction   # +1 down, -1 up
+                        px, py = proj.x, proj.y
+                        pulse  = int(now * 20) % 2
+
+                        # Active power-up aura colours
+                        has_speed  = team.effect_speed_until  and now < team.effect_speed_until
+                        has_rapid  = team.effect_rapid_until  and now < team.effect_rapid_until
+                        has_double = team.effect_double_until and now < team.effect_double_until
+
+                        # --- Beam body: solid bright streak 6 cells behind the head ---
+                        for step in range(1, 7):
+                            by   = py - step * direct      # trail goes opposite to travel direction
+                            fac  = max(0.0, 1.0 - step * 0.16)
+                            core = tuple(int(c * fac) for c in color)
+                            # White-bright core at center
+                            bright_core = tuple(min(255, int(c + (255 - c) * fac * 0.6)) for c in color)
+                            self.set_led(buffer, px, by, bright_core)
+                            # Dim side pixels (beam width)
+                            side = tuple(int(c * fac * 0.35) for c in color)
+                            self.set_led(buffer, px - 1, by, side)
+                            self.set_led(buffer, px + 1, by, side)
+
+                        # --- SPEED aura: yellow sparks streaking behind ---
+                        if has_speed:
+                            YSPARK = (255, 220, 0)
+                            for step in range(1, 9):
+                                sy   = py - step * direct
+                                fac  = max(0.0, 1.0 - step * 0.12)
+                                yc   = tuple(int(c * fac * 0.8) for c in YSPARK)
+                                self.set_led(buffer, px, sy, yc)
+                                if step % 2 == 0:
+                                    self.set_led(buffer, px - 1, sy, tuple(c // 2 for c in yc))
+                                    self.set_led(buffer, px + 1, sy, tuple(c // 2 for c in yc))
+
+                        # --- DOUBLE aura: twin magenta flanking beams ---
+                        if has_double:
+                            MAG = (255, 0, 255)
+                            for step in range(0, 5):
+                                dy  = py - step * direct
+                                fac = max(0.0, 1.0 - step * 0.22)
+                                mc  = tuple(int(c * fac * 0.7) for c in MAG)
+                                self.set_led(buffer, px - 2, dy, mc)
+                                self.set_led(buffer, px + 2, dy, mc)
+
+                        # --- RAPID aura: crackling green energy ring at head ---
+                        if has_rapid:
+                            GRN = (0, 255, 80)
+                            t_crackle = int(now * 12) % 4
+                            ring = [(0,-1),(1,0),(0,1),(-1,0)]
+                            for ri, (rx, ry) in enumerate(ring):
+                                bright = 1.0 if ri == t_crackle else 0.25
+                                rc = tuple(int(c * bright) for c in GRN)
+                                self.set_led(buffer, px + rx, py + ry, rc)
+
+                        # --- Horizontal plasma flare at head ---
+                        flare_c = tuple(min(255, int(c * 1.3)) for c in color)
+                        self.set_led(buffer, px - 1, py, tuple(c // 2 for c in color))
+                        self.set_led(buffer, px + 1, py, tuple(c // 2 for c in color))
+
+                        # --- Bright white-hot head pixel ---
+                        head_c = WHITE if pulse else tuple(min(255, c + 80) for c in color)
+                        self.set_led(buffer, px, py, head_c)
 
                 # 3b. Draw score ripples (expand horizontally along the base row)
                 for rip in self.ripples:
@@ -852,7 +1386,37 @@ class BattleGame:
                 # 4. Launcher bar highlights (first-press pending state)
                 self._render_input_bar_highlight(buffer, now)
 
-                # 5. Active power-up effect indicators on launcher bars
+                # 5. Anime power-up auras on launcher bars
+                for tid, team in self.teams.items():
+                    bar_y = LAUNCHER_ROW_A if tid == 'A' else LAUNCHER_ROW_B
+                    t_anim = int(now * 10) % BOARD_WIDTH   # sweeping position
+
+                    if team.effect_speed_until and now < team.effect_speed_until:
+                        # SPEED — yellow lightning sweep across the bar
+                        for x in range(BOARD_WIDTH):
+                            dist = abs(x - t_anim)
+                            fac  = max(0.0, 1.0 - dist * 0.25)
+                            self.set_led(buffer, x, bar_y, (int(255*fac), int(220*fac), 0))
+                            # spark above/below
+                            if dist < 2:
+                                self.set_led(buffer, x, bar_y - team.direction,
+                                             (int(180*fac), int(150*fac), 0))
+
+                    if team.effect_rapid_until and now < team.effect_rapid_until:
+                        # RAPID — green crackling pulse across entire bar
+                        crackle = int(now * 15) % 2
+                        for x in range(BOARD_WIDTH):
+                            noise = (x * 37 + int(now * 20)) % 3
+                            fac = 1.0 if (crackle and noise == 0) else 0.45
+                            self.set_led(buffer, x, bar_y, (0, int(200*fac), int(80*fac)))
+
+                    if team.effect_double_until and now < team.effect_double_until:
+                        # DOUBLE — magenta twin-pulse ripple from centre outward
+                        t_wave = (now * 6) % 1.0
+                        for x in range(BOARD_WIDTH):
+                            cx_dist = abs(x - BOARD_WIDTH // 2) / (BOARD_WIDTH / 2)
+                            wave    = max(0.0, 1.0 - abs(cx_dist - t_wave) * 4)
+                            self.set_led(buffer, x, bar_y, (int(255*wave), 0, int(255*wave)))
 
 
             return buffer
