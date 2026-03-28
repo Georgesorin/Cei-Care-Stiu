@@ -1,0 +1,10 @@
+[GAME] PLAYING state activated, piano handler starting
+[TICK 50] Buttons: 0 pressed, indices=[]
+[TICK 100] Buttons: 0 pressed, indices=[]
+[TICK 150] Buttons: 1 pressed, indices=[402]
+[TICK 200] Buttons: 1 pressed, indices=[402]
+[TICK 250] Buttons: 1 pressed, indices=[337]
+[TICK 300] Buttons: 1 pressed, indices=[210]
+[TICK 350] Buttons: 0 pressed, indices=[]
+[TICK 400] Buttons: 0 pressed, indices=[]
+[TICK 450] Buttons: 0 pressed, indices=[]
