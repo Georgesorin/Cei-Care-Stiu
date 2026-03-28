@@ -6,6 +6,9 @@ import random
 import copy
 import psutil
 import os
+import sys
+import subprocess
+import importlib.util
 import math
 import wave
 from pathlib import Path
@@ -31,6 +34,39 @@ try:
     PYGAME_AVAILABLE = True
 except ImportError:
     PYGAME_AVAILABLE = False
+
+def _ensure_mido_installed():
+    """Fast one-time check/install for mido on startup."""
+    if importlib.util.find_spec("mido") is not None:
+        return True
+
+    print(f"[MIDI] mido missing for python={sys.executable}. Auto-installing...", flush=True)
+    install_cmd = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--disable-pip-version-check",
+        "--no-input",
+        "--quiet",
+        "mido",
+    ]
+
+    try:
+        result = subprocess.run(install_cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode == 0 and importlib.util.find_spec("mido") is not None:
+            print("[MIDI] Auto-install complete", flush=True)
+            return True
+
+        print(f"[MIDI] Auto-install failed (code {result.returncode})", flush=True)
+        if result.stderr:
+            print(f"[MIDI] pip stderr: {result.stderr[-250:]}", flush=True)
+    except Exception as e:
+        print(f"[MIDI] Auto-install exception: {e}", flush=True)
+
+    return False
+
+MIDO_AVAILABLE = _ensure_mido_installed()
 
 # --- Sample-based Piano (uses real piano samples) ---
 SEMITONE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
