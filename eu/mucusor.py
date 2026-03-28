@@ -68,6 +68,18 @@ CYAN = (0, 255, 255)
 MAGENTA = (255, 0, 255)
 ORANGE = (255, 165, 0)
 GOLD = (255, 215, 0)
+PURPLE_BULLET = (170, 80, 255)
+
+BULLET_NORMAL_COLOR = RED
+BULLET_RARE_COLOR = PURPLE_BULLET
+BULLET_RARE_CHANCE_PER_ROUND = 0.10
+BULLET_RARE_CLICK_HITS = 2
+
+BOMB_MIN_ROUND = 3
+BOMB_CLICK_HITS = 3
+BOMB_CAR_DAMAGE = 2
+BOMB_START_COUNT = 1
+BOMB_ROUND_GROWTH = 1
 
 # Tetris Shapes
 SHAPES = {
@@ -177,13 +189,15 @@ class PresidentialVehicle:
         cls.global_points = max(0, cls.global_points - 1)
         return cls.global_points
 
-    def __init__(self, shape_key, color, x, y):
+    def __init__(self, shape_key, color, x, y, click_hits_required=1):
         self.shape_key = shape_key
         self.blocks = copy.deepcopy(SHAPES[shape_key])
         self.color = color
         self.x = x
         self.y = y
         self.active = True
+        self.click_hits_required = max(1, int(click_hits_required))
+        self.click_hits_remaining = self.click_hits_required
 
     def get_absolute_blocks(self):
         return [(self.x + bx, self.y + by) for bx, by in self.blocks]
@@ -212,7 +226,20 @@ class Player:
         else:
             spawn_x = random.randint(0, BOARD_WIDTH - 1)
             spawn_y = random.randint(0, BOARD_HEIGHT - 1)
-        self.piece = PresidentialVehicle(shape_key, self.color, spawn_x, spawn_y)
+        round_number = 1
+        if hasattr(self, 'game') and hasattr(self.game, 'round_number'):
+            round_number = max(1, int(self.game.round_number))
+        rare_chance = min(1.0, max(0.0, (round_number - 1) * BULLET_RARE_CHANCE_PER_ROUND))
+        is_rare = random.random() < rare_chance
+        piece_color = BULLET_RARE_COLOR if is_rare else self.color
+        required_clicks = BULLET_RARE_CLICK_HITS if is_rare else 1
+        self.piece = PresidentialVehicle(
+            shape_key,
+            piece_color,
+            spawn_x,
+            spawn_y,
+            click_hits_required=required_clicks,
+        )
         self.last_progress_time = time.time()
 
 
@@ -440,6 +467,7 @@ class PresidentGame:
         self.obstacle_color = (64, 64, 64)  # dark gray
         self.current_obstacle_map = []
         self.cop_spawn_points = self._build_cop_spawn_points()
+        self.bombs = []
         self.cop_move_interval = 10.0
         self.last_cop_move_time = time.time()
 
@@ -547,12 +575,132 @@ class PresidentGame:
         p.respawn_time = time.time() + self.respawn_delay
         print(f"Player {p.id} bullet destroyed by {reason}.")
 
+    def _apply_global_damage(self, amount, reason):
+        if PresidentialVehicle.global_points <= 0:
+            return
+
+        amount = max(1, int(amount))
+        points_left = PresidentialVehicle.global_points
+        for _ in range(amount):
+            points_left = PresidentialVehicle.apply_hit()
+            if points_left <= 0:
+                break
+
+        self.sound.play_hit()
+        if points_left <= 0:
+            print(f"Global car health depleted by {reason}!")
+            self._check_game_over()
+        else:
+            print(f"Global car took {amount} damage from {reason}. Points left: {points_left}")
+
+    def _apply_click_damage(self, p, reason):
+        if not (p.piece and p.piece.active):
+            return False
+
+        if getattr(p.piece, 'click_hits_remaining', 1) > 1:
+            p.piece.click_hits_remaining -= 1
+            print(
+                f"Player {p.id} rare bullet damaged by {reason}. "
+                f"{p.piece.click_hits_remaining} click left."
+            )
+            return False
+
+        self._destroy_player_piece(p, reason)
+        return True
+
     def _check_game_over(self):
         if PresidentialVehicle.global_points <= 0:
             self.state = 'GAMEOVER'
             self.game_over_timer = time.time()
             self.winner_player = None
             self.sound.play_loss()
+
+    def _bomb_cell_next_to_officer(self, sx, sy):
+        left, right, top, bottom = self._edge_loop_bounds()
+        min_x = left - 1
+        max_x = right + 1
+        min_y = top
+        max_y = bottom + 1
+
+        if sx <= 0:
+            return min_x, max(min_y, min(max_y, sy))
+        if sx >= BOARD_WIDTH - 1:
+            return max_x, max(min_y, min(max_y, sy))
+        if sy <= 0:
+            return max(min_x, min(max_x, sx)), top
+        if sy >= BOARD_HEIGHT - 1:
+            return max(min_x, min(max_x, sx)), bottom + 1
+        return None, None
+
+    def _spawn_bombs_for_round(self):
+        self.bombs = []
+        if self.round_number < BOMB_MIN_ROUND:
+            return
+
+        obstacle_cells = self._obstacle_cells()
+        candidates = []
+        occupied = set()
+        for sx, sy in self.cop_spawn_points:
+            bx, by = self._bomb_cell_next_to_officer(sx, sy)
+            if bx is None:
+                continue
+            if (bx, by) in occupied:
+                continue
+            if not (0 <= bx < BOARD_WIDTH and 0 <= by < BOARD_HEIGHT):
+                continue
+            if (bx, by) in obstacle_cells:
+                continue
+
+            occupied.add((bx, by))
+            candidates.append((bx, by))
+
+        if not candidates:
+            return
+
+        # Ramp bomb pressure by round: round 3 starts light and increases each round.
+        rounds_since_bombs = self.round_number - BOMB_MIN_ROUND
+        target_bombs = BOMB_START_COUNT + (rounds_since_bombs * BOMB_ROUND_GROWTH)
+        target_bombs = max(1, min(len(candidates), target_bombs))
+
+        random.shuffle(candidates)
+        for bx, by in candidates[:target_bombs]:
+            self.bombs.append({
+                'x': bx,
+                'y': by,
+                'hits_remaining': BOMB_CLICK_HITS,
+            })
+
+    def _apply_bomb_click_damage(self, bomb, reason):
+        bomb['hits_remaining'] -= 1
+        if bomb['hits_remaining'] > 0:
+            print(
+                f"Bomb at ({bomb['x']},{bomb['y']}) damaged by {reason}. "
+                f"{bomb['hits_remaining']} steps left."
+            )
+            return False
+
+        print(f"Bomb at ({bomb['x']},{bomb['y']}) destroyed by {reason}.")
+        self.bombs = [b for b in self.bombs if b is not bomb]
+        return True
+
+    def _check_big_cube_bomb_collision(self):
+        if not self.big_cube or not self.bombs:
+            return
+
+        big_cells = set(self._big_cube_cells())
+        exploded = []
+        for bomb in self.bombs:
+            if (bomb['x'], bomb['y']) in big_cells:
+                exploded.append(bomb)
+
+        if not exploded:
+            return
+
+        for bomb in exploded:
+            print(f"Bomb at ({bomb['x']},{bomb['y']}) exploded on the car.")
+            self._apply_global_damage(BOMB_CAR_DAMAGE, f"bomb ({bomb['x']},{bomb['y']})")
+
+        self.bombs = [b for b in self.bombs if b not in exploded]
 
     def _determine_winner_by_hits(self):
         if not self.players:
@@ -900,6 +1048,7 @@ class PresidentGame:
         self.apply_color_scheme()
         self._populate_obstacles()
         self.cop_spawn_points = self._build_cop_spawn_points()
+        self._spawn_bombs_for_round()
         self.last_cop_move_time = time.time()
 
         # Reset visuals and player pieces for the next timed round.
@@ -932,8 +1081,8 @@ class PresidentGame:
         self.players = []
         if count < 1: count = 1
 
-        # All bullets are gold
-        bullet_color = GOLD
+        # Default bullet type is red. Rare bullets override their color on spawn.
+        bullet_color = BULLET_NORMAL_COLOR
         width = 16 // count
         for i in range(count):
             start = i * width
@@ -994,11 +1143,21 @@ class PresidentGame:
 
                 # Find and delete any cube at this column
                 hit_registered = False
+                for bomb in list(self.bombs):
+                    if bomb['x'] == x:
+                        self._apply_bomb_click_damage(bomb, f"column {x}")
+                        hit_registered = True
+                        break
+
+                if hit_registered:
+                    self.prev_button_states[i] = is_pressed
+                    continue
+
                 for p in self.players:
                     if p.piece and p.piece.active:
                         for bx, by in p.piece.get_absolute_blocks():
                             if bx == x:
-                                self._destroy_player_piece(p, f"column {x}")
+                                self._apply_click_damage(p, f"column {x}")
                                 hit_registered = True
                                 break
                         if hit_registered:
@@ -1188,6 +1347,9 @@ class PresidentGame:
             # Handle queued immediate board hits from recv loop
             self.process_board_touch_queue()
 
+            # Bombs are static hazards on the car path from round 3 onward.
+            self._check_big_cube_bomb_collision()
+
             # Big cube movement
             now = time.time()
             if now - self.big_cube_last_move >= self.big_cube_speed:
@@ -1327,6 +1489,7 @@ class PresidentGame:
                                 for bx, by in p.piece.get_absolute_blocks():
                                     if 0 <= bx < BOARD_WIDTH and 0 <= by < BOARD_HEIGHT:
                                         self.trail[by][bx] = 1.0
+                                        self.trail_color[by][bx] = p.piece.color
                 
                 self.last_tick += frames_to_execute * self.current_fall_speed
 
@@ -1355,7 +1518,12 @@ class PresidentGame:
                             break
 
             if hit:
-                self._destroy_player_piece(p, f"touch ({x},{y})")
+                self._apply_click_damage(p, f"touch ({x},{y})")
+                return True
+
+        for bomb in list(self.bombs):
+            if bomb['x'] == x and bomb['y'] == y:
+                self._apply_bomb_click_damage(bomb, f"touch ({x},{y})")
                 return True
 
         return False
@@ -1433,7 +1601,7 @@ class PresidentGame:
         # Use current color scheme
         scheme = self._get_active_color_scheme()
         obstacle_color = scheme['obstacle']
-        bullet_color = scheme['bullet']
+        bullet_color = BULLET_NORMAL_COLOR
 
         if self.state == 'LOBBY':
             # Animated lobby backdrop: layered waves + moving scanline + sparkles.
@@ -1737,16 +1905,34 @@ class PresidentGame:
                     )
                     self.set_led(buffer, sx, sy, cop_blue)
 
+                # Static bombs on the car path (from round 3 onward).
+                for bomb in self.bombs:
+                    bx, by = bomb['x'], bomb['y']
+                    hp = bomb.get('hits_remaining', 1)
+                    if hp >= 3:
+                        core = (140, 60, 255)
+                    elif hp == 2:
+                        core = (170, 90, 255)
+                    else:
+                        core = (205, 135, 255)
+
+                    self.set_led(buffer, bx, by, core)
+                    for gx, gy in [(bx - 1, by), (bx + 1, by), (bx, by - 1), (bx, by + 1)]:
+                        if 0 <= gx < BOARD_WIDTH and 0 <= gy < BOARD_HEIGHT:
+                            glow = (int(core[0] * 0.22), int(core[1] * 0.22), int(core[2] * 0.22))
+                            self.set_led(buffer, gx, gy, glow)
+
                 # Draw trail behind pieces.
                 for y in range(BOARD_HEIGHT):
                     for x in range(BOARD_WIDTH):
                         if self.trail[y][x] > 0.02:
                             trail_intensity = self.trail[y][x]
                             trail_scale = 0.10 + 0.50 * trail_intensity
+                            base_trail_color = self.trail_color[y][x] if self.trail_color[y][x] != BLACK else bullet_color
                             trail_color = (
-                                int(bullet_color[0] * trail_scale),
-                                int(bullet_color[1] * trail_scale),
-                                int(bullet_color[2] * trail_scale)
+                                int(base_trail_color[0] * trail_scale),
+                                int(base_trail_color[1] * trail_scale),
+                                int(base_trail_color[2] * trail_scale)
                             )
                             self.set_led(buffer, x, y, trail_color)
 
@@ -1754,16 +1940,17 @@ class PresidentGame:
                 for p in self.players:
                     if p.piece and p.piece.active:
                         for bx, by in p.piece.get_absolute_blocks():
+                            core_color = p.piece.color
                             for gx, gy in [(bx-1, by), (bx+1, by), (bx, by-1), (bx, by+1)]:
                                 if 0 <= gx < BOARD_WIDTH and 0 <= gy < BOARD_HEIGHT:
                                     glow = (
-                                        int(bullet_color[0] * 0.24),
-                                        int(bullet_color[1] * 0.24),
-                                        int(bullet_color[2] * 0.24)
+                                        int(core_color[0] * 0.24),
+                                        int(core_color[1] * 0.24),
+                                        int(core_color[2] * 0.24)
                                     )
                                     self.set_led(buffer, gx, gy, glow)
                             if 0 <= bx < BOARD_WIDTH and 0 <= by < BOARD_HEIGHT:
-                                self.set_led(buffer, bx, by, bullet_color)
+                                self.set_led(buffer, bx, by, core_color)
 
                 # Draw player pieces core.
                 for p in self.players:
@@ -1854,6 +2041,8 @@ class PresidentGame:
                 for y in range(BOARD_HEIGHT):
                     for x in range(BOARD_WIDTH):
                         self.trail[y][x] *= self.trail_decay
+                        if self.trail[y][x] < 0.02:
+                            self.trail_color[y][x] = BLACK
 
             return buffer
 
