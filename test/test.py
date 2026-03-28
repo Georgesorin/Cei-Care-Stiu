@@ -8,7 +8,6 @@ import psutil
 import os
 import sys
 import subprocess
-import importlib.util
 import math
 import wave
 from pathlib import Path
@@ -194,8 +193,8 @@ _CFG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tetris_con
 def _load_config():
     defaults = {
         "device_ip": "255.255.255.255",
-        "send_port": 7270,
-        "recv_port": 7271,
+        "send_port": 7274,
+        "recv_port": 7275,
         "bind_ip": "0.0.0.0"
     }
     try:
@@ -209,8 +208,8 @@ CONFIG = _load_config()
 
 # --- Networking Constants ---
 UDP_SEND_IP = CONFIG.get("device_ip", "255.255.255.255")
-UDP_SEND_PORT = CONFIG.get("send_port", 7270)
-UDP_LISTEN_PORT = CONFIG.get("recv_port", 7271)
+UDP_SEND_PORT = CONFIG.get("send_port", 7274)
+UDP_LISTEN_PORT = CONFIG.get("recv_port", 7275)
 
 # --- Matrix Constants ---
 NUM_CHANNELS = 8
@@ -371,16 +370,16 @@ class PianoController:
 
     def _generate_note_frequencies(self):
         """
-        Generate 50 note frequencies starting from C2.
+        Generate 50 note frequencies starting from C3.
         Uses equal temperament tuning: each semitone = frequency * 2^(1/12)
-        C2 = 65.41 Hz, goes up chromatically for 50 notes
+        C3 = 130.81 Hz, goes up chromatically for 50 notes
         """
         notes = []
-        c2_freq = 65.41  # C2 frequency in Hz
+        c3_freq = 130.81  # C3 frequency in Hz
         semitone_ratio = 2.0 ** (1.0 / 12.0)  # Ratio between semitones
         
         for i in range(50):
-            freq = c2_freq * (semitone_ratio ** i)
+            freq = c3_freq * (semitone_ratio ** i)
             notes.append(freq)
         
         return notes
@@ -524,8 +523,8 @@ class PianoController:
         """Start a held note: play sample with looping sustain until release."""
         if self.sample_bank is not None and self.mixer_available:
             try:
-                # Get MIDI note number (C2 = 12, +note_idx semitones)
-                midi_note = 12 + note_idx
+                # Get MIDI note number (C3 = 48, +note_idx semitones)
+                midi_note = 48 + note_idx
                 
                 # Get audio sample from bank and loop it
                 audio_data = self.sample_bank.get(midi_note, velocity=0.80)
@@ -732,8 +731,263 @@ class PianoController:
         """Convert semitone offset from C3 to note name"""
         note_names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
         note_in_octave = semitone_offset % 12
-        octave = 2 + (semitone_offset // 12)
+        octave = 3 + (semitone_offset // 12)
         return f"{note_names[note_in_octave]}{octave}"
+
+
+class MidiSongPlayer:
+    """
+    Visual-only MIDI guide.
+    Phase 1: notes fade in while stationary at center.
+    Phase 2: notes move toward the right piano column.
+    """
+    # Visual-only mode: notes stay in the middle and fade in before play time.
+    MIDDLE_COL_LEFT = 7
+    MIDDLE_COL_RIGHT = 8
+    TARGET_COL_LEFT = 2
+    TARGET_COL_RIGHT = 13
+    MOVE_SPEED = 1
+    MOVE_STEP_FRAMES = 2  # Move every N render frames to slow travel
+    LINGER_SECONDS = 0.20 # Keep note visible briefly at piano roll
+    TEMPO_SCALE = 2.0     # 2x time => half BPM
+    LEAD_TICKS = 13  # ~0.65s at 20 FPS (render loop is 50 ms)
+    MAX_SPAWNS_PER_FRAME = 6  # Queue budget to avoid bursty visual updates
+
+    SHARP_POSITIONS = {1, 3, 6, 8, 10}
+    COLOR_NATURAL = (0, 200, 220)    # cyan
+    COLOR_SHARP   = (255, 130, 0)    # orange
+
+    def __init__(self, midi_path, piano_controller):
+        self.piano = piano_controller
+        self.midi_path = midi_path
+        self.all_notes = []      # immutable source notes for replay
+        self.flying_notes = []   # active on-screen note blocks
+        self.pending_notes = []  # notes waiting to be spawned, sorted by spawn_time
+        self.spawn_queue = []    # due notes waiting to be released under frame budget
+        self.song_started = False
+        self.start_time = None
+        self.finished = False
+        self._current_elapsed = 0.0
+        self._update_counter = 0
+        self._debug_last_spawn_log = -1
+        self._debug_last_pending_head = None
+        self._load_midi(midi_path)
+        self._reset_song_state()
+
+    def _reset_song_state(self):
+        """Reset runtime song state so the same MIDI can be played again."""
+        self.pending_notes = [dict(n) for n in self.all_notes]
+        self.spawn_queue = []
+        self.flying_notes = []
+        self.finished = False
+        self.song_started = False
+        self._current_elapsed = 0.0
+        self._update_counter = 0
+
+    def _load_midi(self, path):
+        try:
+            import mido
+            print(f"[MIDI] Python executable: {sys.executable}", flush=True)
+            print(f"[MIDI] mido version: {getattr(mido, '__version__', 'unknown')}", flush=True)
+        except ImportError:
+            print(f"[MIDI] mido missing for python={sys.executable}. Trying auto-install...", flush=True)
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "mido"],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                if result.returncode != 0:
+                    print(f"[MIDI] Auto-install failed (code {result.returncode})", flush=True)
+                    if result.stderr:
+                        print(f"[MIDI] pip stderr: {result.stderr[-300:]}", flush=True)
+                    return
+
+                import mido
+                print(f"[MIDI] Auto-install OK. mido version: {getattr(mido, '__version__', 'unknown')}", flush=True)
+            except Exception as e:
+                print(f"[MIDI] Auto-install exception: {e}", flush=True)
+                return
+
+        mid = mido.MidiFile(path)
+        lead_time = self.LEAD_TICKS * 0.05  # 13 frames * 50ms per frame = 0.65s
+
+        events = []
+        abs_time = 0.0
+        for msg in mid:               # mido yields messages with time in seconds
+            abs_time += msg.time
+            if msg.type == 'note_on' and msg.velocity > 0:
+                events.append((abs_time, msg.note))
+
+        parsed_notes = []
+        for play_time, midi_note in events:
+            scaled_play_time = play_time * self.TEMPO_SCALE
+            # Piano roll base is C3 (MIDI 48)
+            note_idx = max(0, min(BOARD_HEIGHT - 1, midi_note - 48))
+            row = (BOARD_HEIGHT - 1) - note_idx
+            is_sharp = (note_idx % 12) in self.SHARP_POSITIONS
+            color = self.COLOR_SHARP if is_sharp else self.COLOR_NATURAL
+            parsed_notes.append({
+                'spawn_time': max(0.0, scaled_play_time - lead_time),
+                'play_time':  scaled_play_time,
+                'note_idx':   note_idx,
+                'row':        row,
+                'color':      color,
+            })
+
+        parsed_notes.sort(key=lambda n: n['spawn_time'])
+        self.all_notes = parsed_notes
+        print(f"[MIDI] Loaded {len(self.all_notes)} notes from {path}", flush=True)
+        if self.all_notes:
+            first_spawn = self.all_notes[0]['spawn_time']
+            last_spawn = self.all_notes[-1]['spawn_time']
+            print(
+                f"[MIDI] Spawn window: first={first_spawn:.3f}s last={last_spawn:.3f}s lead={lead_time:.3f}s tempo_scale={self.TEMPO_SCALE}",
+                flush=True,
+            )
+            print(
+                f"[MIDI] First note preview: play={self.all_notes[0]['play_time']:.3f}s row={self.all_notes[0]['row']} idx={self.all_notes[0]['note_idx']}",
+                flush=True,
+            )
+        else:
+            print("[MIDI] WARNING: No note_on events were parsed from MIDI", flush=True)
+
+    def start(self):
+        # Safety: if note cache is empty for any reason, retry loading now.
+        if not self.all_notes:
+            try:
+                file_exists = os.path.exists(self.midi_path)
+                file_size = os.path.getsize(self.midi_path) if file_exists else -1
+                print(
+                    f"[MIDI] WARNING start() with empty all_notes. Reloading path={self.midi_path} exists={file_exists} size={file_size}",
+                    flush=True,
+                )
+                if file_exists:
+                    self._load_midi(self.midi_path)
+            except Exception as e:
+                print(f"[MIDI] ERROR during start() reload: {e}", flush=True)
+
+        self._reset_song_state()
+        self.start_time = time.time()
+        self.song_started = True
+        print(
+            f"[MIDI] Song playback started | all_notes={len(self.all_notes)} pending={len(self.pending_notes)} flying={len(self.flying_notes)}",
+            flush=True,
+        )
+
+    def update(self):
+        """Call once per frame to advance note positions."""
+        if not self.song_started or self.finished:
+            return
+
+        self._update_counter += 1
+        elapsed = time.time() - self.start_time
+        queued_this_frame = 0
+        spawned_this_frame = 0
+
+        # Move due notes into queue first.
+        while self.pending_notes and self.pending_notes[0]['spawn_time'] <= elapsed:
+            self.spawn_queue.append(self.pending_notes.pop(0))
+            queued_this_frame += 1
+
+        # Release only a limited number from queue each frame.
+        budget = self.MAX_SPAWNS_PER_FRAME
+        while budget > 0 and self.spawn_queue:
+            n = self.spawn_queue.pop(0)
+            spawned_this_frame += 1
+            budget -= 1
+            # Right-side indicator only
+            self.flying_notes.append({
+                'row': n['row'], 'x': self.MIDDLE_COL_RIGHT,
+                'color': n['color'],
+                'spawn_time': n['spawn_time'], 'play_time': n['play_time'],
+                'phase': 'fade', 'target_x': self.TARGET_COL_RIGHT, 'dx': self.MOVE_SPEED,
+            })
+
+        if queued_this_frame > 0 or spawned_this_frame > 0:
+            print(
+                f"[MIDI DBG] frame={self._update_counter} elapsed={elapsed:.3f}s queued={queued_this_frame} spawned={spawned_this_frame} queue={len(self.spawn_queue)} pending={len(self.pending_notes)} flying={len(self.flying_notes)}",
+                flush=True,
+            )
+
+        # Heartbeat log every ~1s at 20 FPS.
+        if self._update_counter % 20 == 0:
+            next_spawn = self.pending_notes[0]['spawn_time'] if self.pending_notes else None
+            if next_spawn is not None:
+                until_next = next_spawn - elapsed
+                next_head = f"{next_spawn:.3f}"
+            else:
+                until_next = None
+                next_head = "none"
+
+            if self._debug_last_pending_head != next_head:
+                self._debug_last_pending_head = next_head
+
+            print(
+                f"[MIDI DBG] heartbeat frame={self._update_counter} elapsed={elapsed:.3f}s pending={len(self.pending_notes)} queue={len(self.spawn_queue)} flying={len(self.flying_notes)} next_spawn={next_head} in={until_next if until_next is None else round(until_next, 3)}",
+                flush=True,
+            )
+
+        self._current_elapsed = elapsed
+
+        # Fade phase at center -> move phase toward piano roll.
+        for n in self.flying_notes:
+            if n['phase'] == 'fade':
+                if elapsed >= n['play_time']:
+                    n['phase'] = 'move'
+            elif n['phase'] == 'move':
+                # Slower motion: only step every MOVE_STEP_FRAMES frames.
+                if (self._update_counter % self.MOVE_STEP_FRAMES) == 0:
+                    n['x'] += n['dx']
+
+        # Convert reached move notes into linger notes.
+        for n in self.flying_notes:
+            if n['phase'] == 'move':
+                if n['dx'] < 0 and n['x'] <= n['target_x']:
+                    n['x'] = n['target_x']
+                    n['phase'] = 'linger'
+                    n['linger_until'] = elapsed + self.LINGER_SECONDS
+                elif n['dx'] > 0 and n['x'] >= n['target_x']:
+                    n['x'] = n['target_x']
+                    n['phase'] = 'linger'
+                    n['linger_until'] = elapsed + self.LINGER_SECONDS
+
+        # Remove notes only after linger expires.
+        kept = []
+        for n in self.flying_notes:
+            if n['phase'] == 'linger':
+                if elapsed >= n.get('linger_until', elapsed):
+                    continue
+            kept.append(n)
+        self.flying_notes = kept
+
+        # Mark as finished when nothing is left
+        if not self.pending_notes and not self.spawn_queue and not self.flying_notes:
+            self.finished = True
+            print(
+                f"[MIDI] Song finished at elapsed={elapsed:.3f}s frame={self._update_counter}",
+                flush=True,
+            )
+
+    def get_flying_notes(self):
+        """Return two-phase guide notes: fade at center, then move outward."""
+        result = []
+        for n in self.flying_notes:
+            if n['phase'] == 'fade':
+                total = max(0.001, n['play_time'] - n['spawn_time'])
+                t = (self._current_elapsed - n['spawn_time']) / total
+                t = max(0.0, min(1.0, t))
+                # brightness goes from 0.15 at spawn to 1.0 at play time
+                brightness = max(0.15, t)
+            else:
+                brightness = 1.0
+            r = int(n['color'][0] * brightness)
+            g = int(n['color'][1] * brightness)
+            b = int(n['color'][2] * brightness)
+            result.append({**n, 'color': (r, g, b)})
+        return result
+
 
 class Player:
     """Player class for tracking score and input control"""
@@ -816,6 +1070,26 @@ class TestGame:
         # Initialize piano controller for button-to-note mapping
         self.piano = PianoController()
 
+        # Load MIDI song — first song.mid, then any .mid file in the test folder
+        self.midi_player = None
+        test_dir = os.path.dirname(os.path.abspath(__file__))
+        midi_path = os.path.join(test_dir, "song.mid")
+        if not os.path.exists(midi_path):
+            mid_files = [f for f in os.listdir(test_dir) if f.lower().endswith('.mid')]
+            if mid_files:
+                midi_path = os.path.join(test_dir, mid_files[0])
+                print(f"[MIDI] Found MIDI file: {mid_files[0]}", flush=True)
+            else:
+                midi_path = None
+        if midi_path and os.path.exists(midi_path):
+            try:
+                self.midi_player = MidiSongPlayer(midi_path, self.piano)
+                print(f"[MIDI] Song loaded: {midi_path}", flush=True)
+            except Exception as e:
+                print(f"[MIDI] Failed to load song: {e}", flush=True)
+        else:
+            print(f"[MIDI] No .mid files found in {test_dir}", flush=True)
+
     def _build_player_button_map(self, row_groups_left, row_groups_right, left_edge, right_edge):
         """Build 10-player button map from row-group bands.
 
@@ -893,18 +1167,18 @@ class TestGame:
                 self.board[y][x] = DIM_DARK_BLUE
 
         # ===========================================
+        # MIDI FLYING NOTES
+        # ===========================================
+        if self.midi_player:
+            for note in self.midi_player.get_flying_notes():
+                x, y = note['x'], note['row']
+                if 0 <= x < BOARD_WIDTH and 0 <= y < BOARD_HEIGHT:
+                    self.set_led(frame_buffer, x, y, note['color'])
+
+        # ===========================================
         # MATRIX BORDER AND CENTER COLUMN
         # ===========================================
         # Draw white border around perimeter and vertical center column
-
-        # Top and bottom border stay white.
-        for x in range(BOARD_WIDTH):
-            # Top border (row 0)
-            self.set_led(frame_buffer, x, 0, WHITE)
-            self.board[0][x] = WHITE
-            # Bottom border (last row)
-            self.set_led(frame_buffer, x, BOARD_HEIGHT - 1, WHITE)
-            self.board[BOARD_HEIGHT - 1][x] = WHITE
 
         # Left/right borders (2 columns wide each side) follow piano key color per row:
         # sharps are black, naturals are white.
@@ -959,6 +1233,10 @@ class TestGame:
         if not self.player_button_map:
             self._build_player_button_map(ROW_GROUPS_LEFT, ROW_GROUPS_RIGHT, LEFT_EDGE, RIGHT_EDGE)
 
+        # Advance MIDI song animation (runs at render rate ~20fps, correct speed)
+        if self.midi_player and self.state == 'PLAYING':
+            self.midi_player.update()
+
         # Step 3: Update animation timing
         self.time_counter += 1
         self.prev_button_states = self.button_states.copy()
@@ -982,6 +1260,8 @@ class TestGame:
                         print("FIGHT! Game Starting...")
                         self.state = 'PLAYING'
                         self.game_start_time = time.time()
+                        if self.midi_player:
+                            self.midi_player.start()
                 return
 
             if self.state == 'PLAYING':
