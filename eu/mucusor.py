@@ -12,6 +12,14 @@ from collections import deque
 import json
 
 try:
+    import tkinter as tk
+    from tkinter import messagebox
+
+    TK_AVAILABLE = True
+except Exception:
+    TK_AVAILABLE = False
+
+try:
     import pygame
 
     PYGAME_AVAILABLE = True
@@ -36,6 +44,16 @@ def _load_config():
     except Exception:
         pass
     return defaults
+
+
+def _save_config(config_data):
+    try:
+        with open(_CFG_FILE, "w", encoding="utf-8") as f:
+            json.dump(config_data, f, indent=2)
+        return True
+    except Exception as exc:
+        print(f"Config save failed: {exc}")
+        return False
 
 
 CONFIG = _load_config()
@@ -656,13 +674,13 @@ class PresidentGame:
             self._check_game_over()
         else:
             p.respawn_time = time.time() + self.respawn_delay
-            print(f"Player {p.id} hit by {reason}! Global points left: {points_left}")
+            print(f"Bullet {p.id} hit by {reason}! Global points left: {points_left}")
 
     def _destroy_player_piece(self, p, reason):
         if p.piece:
             p.piece.active = False
         p.respawn_time = time.time() + self.respawn_delay
-        print(f"Player {p.id} bullet destroyed by {reason}.")
+        print(f"Bullet {p.id} destroyed by {reason}.")
 
         self.sound.play_deflect()
 
@@ -692,7 +710,7 @@ class PresidentGame:
             p.piece.click_hits_remaining -= 1
             self.sound.play_attack()
             print(
-                f"Player {p.id} rare bullet damaged by {reason}. "
+                f"Bullet {p.id} damaged by {reason}. "
                 f"{p.piece.click_hits_remaining} click left."
             )
             return False
@@ -1439,7 +1457,7 @@ class PresidentGame:
                         p.directionX = 1 if dx >= 0 else -1
                         p.directionY = 1 if dy >= 0 else -1
                     p.last_progress_time = time.time()
-                    print(f"Player {p.id} cube respawned!")
+                    print(f"Bullet {p.id} respawned!")
 
             # Check for clicks on active cubes via button inputs (channel 7)
             self.process_inputs()
@@ -2341,6 +2359,7 @@ class NetworkManager:
         self.sock_send = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock_send.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         self.sock_recv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock_lock = threading.Lock()
         self.running = True
         self.sequence_number = 0
         self.prev_button_states = [False] * 64
@@ -2361,6 +2380,31 @@ class NetworkManager:
         except Exception as e:
             print(f"Critical Error: Could not bind receive socket to port {UDP_LISTEN_PORT}: {e}")
             self.running = False
+
+    def update_ports(self, send_port, recv_port):
+        global UDP_SEND_PORT, UDP_LISTEN_PORT
+
+        send_port = int(send_port)
+        recv_port = int(recv_port)
+        if not (1 <= send_port <= 65535 and 1 <= recv_port <= 65535):
+            raise ValueError("Ports must be in range 1-65535")
+
+        # Build and bind replacement receive socket first so we never drop into an invalid state.
+        new_recv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        new_recv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        new_recv_sock.bind(("0.0.0.0", recv_port))
+
+        with self.sock_lock:
+            old_recv_sock = self.sock_recv
+            self.sock_recv = new_recv_sock
+
+        try:
+            old_recv_sock.close()
+        except Exception:
+            pass
+
+        UDP_SEND_PORT = send_port
+        UDP_LISTEN_PORT = recv_port
 
     def send_loop(self):
         while self.running:
@@ -2487,7 +2531,9 @@ class NetworkManager:
     def recv_loop(self):
         while self.running:
             try:
-                data, _ = self.sock_recv.recvfrom(2048)
+                with self.sock_lock:
+                    recv_sock = self.sock_recv
+                data, _ = recv_sock.recvfrom(2048)
                 if len(data) >= 1373 and data[0] == 0x88:
                     # Read board touch data from channels 0-6 (rows 0-27)
                     for channel in range(7):
@@ -2518,6 +2564,9 @@ class NetworkManager:
                         is_pressed = (val == 0xCC)
                         self.game.button_states[led_idx] = is_pressed
 
+            except OSError:
+                # Socket can be briefly interrupted while ports are being reconfigured.
+                time.sleep(0.05)
             except Exception:
                 pass
 
@@ -2535,6 +2584,478 @@ def game_thread_func(game):
         game.tick()
         time.sleep(0.01)
 
+
+class GameControlUI:
+    def __init__(self, game, net):
+        self.game = game
+        self.net = net
+
+        self.ui_bg = "#10151d"
+        self.ui_panel = "#18212b"
+        self.ui_panel_alt = "#1f2b38"
+        self.ui_fg = "#e7eef7"
+        self.ui_muted = "#9fb2c7"
+        self.ui_accent = "#26c6da"
+
+        self.root = tk.Tk()
+        self.root.title("Protect the car Control")
+        self.root.geometry("500x360")
+        self.root.resizable(False, False)
+        self.root.protocol("WM_DELETE_WINDOW", self.quit_game)
+        self.root.configure(bg=self.ui_bg)
+
+        self.players_var = tk.StringVar(value="5")
+        self.minutes_var = tk.StringVar(value="2")
+        self.rounds_var = tk.StringVar(value="5")
+        self.fall_speed_var = tk.StringVar(value="0.40")
+        self.status_var = tk.StringVar(value="Ready")
+        self.settings_window = None
+        self.send_port_var = tk.StringVar(value=str(UDP_SEND_PORT))
+        self.recv_port_var = tk.StringVar(value=str(UDP_LISTEN_PORT))
+
+        self._build_controls()
+        self._build_stats_window()
+        self._schedule_stats_update()
+
+    def _build_controls(self):
+        title = tk.Label(
+            self.root,
+            text="Protect the car Mission Control",
+            bg=self.ui_bg,
+            fg=self.ui_fg,
+            font=("Segoe UI", 14, "bold"),
+            anchor="w",
+        )
+        title.pack(fill="x", padx=12, pady=(10, 4))
+
+        preset_frame = tk.LabelFrame(
+            self.root,
+            text="Difficulty",
+            padx=8,
+            pady=8,
+            bg=self.ui_panel,
+            fg=self.ui_fg,
+            font=("Segoe UI", 9, "bold"),
+            bd=1,
+            relief="ridge",
+        )
+        preset_frame.pack(fill="x", padx=10, pady=(10, 6))
+
+        tk.Button(
+            preset_frame,
+            text="Easy",
+            width=10,
+            command=lambda: self.start_preset("EASY"),
+            bg="#1f8f5f",
+            fg="white",
+            activebackground="#28a86f",
+            activeforeground="white",
+            relief="flat",
+        ).pack(side="left", padx=5)
+        tk.Button(
+            preset_frame,
+            text="Normal",
+            width=10,
+            command=lambda: self.start_preset("NORMAL"),
+            bg="#1976d2",
+            fg="white",
+            activebackground="#2488eb",
+            activeforeground="white",
+            relief="flat",
+        ).pack(side="left", padx=5)
+        tk.Button(
+            preset_frame,
+            text="Hard",
+            width=10,
+            command=lambda: self.start_preset("HARD"),
+            bg="#b14a28",
+            fg="white",
+            activebackground="#c45a34",
+            activeforeground="white",
+            relief="flat",
+        ).pack(side="left", padx=5)
+
+        custom_frame = tk.LabelFrame(
+            self.root,
+            text="Custom Start",
+            padx=8,
+            pady=8,
+            bg=self.ui_panel,
+            fg=self.ui_fg,
+            font=("Segoe UI", 9, "bold"),
+            bd=1,
+            relief="ridge",
+        )
+        custom_frame.pack(fill="x", padx=10, pady=6)
+
+        label_opts = {"bg": self.ui_panel, "fg": self.ui_fg, "font": ("Segoe UI", 9, "bold")}
+        entry_opts = {
+            "width": 8,
+            "bg": self.ui_panel_alt,
+            "fg": self.ui_fg,
+            "insertbackground": self.ui_fg,
+            "relief": "flat",
+            "highlightthickness": 1,
+            "highlightbackground": "#2e3f51",
+            "highlightcolor": self.ui_accent,
+        }
+        arrow_opts = {
+            "width": 3,
+            "bg": "#2b3d50",
+            "fg": self.ui_fg,
+            "activebackground": "#365169",
+            "activeforeground": self.ui_fg,
+            "relief": "flat",
+        }
+
+        tk.Label(custom_frame, text="Bullets:", **label_opts).grid(row=0, column=0, sticky="w")
+        tk.Entry(custom_frame, textvariable=self.players_var, **entry_opts).grid(row=0, column=1, padx=6, pady=3, sticky="w")
+        tk.Button(custom_frame, text="<", command=lambda: self._adjust_int_var(self.players_var, -1, 1), **arrow_opts).grid(row=0, column=2, padx=2)
+        tk.Button(custom_frame, text=">", command=lambda: self._adjust_int_var(self.players_var, 1, 1), **arrow_opts).grid(row=0, column=3, padx=2)
+
+        tk.Label(custom_frame, text="Minutes:", **label_opts).grid(row=1, column=0, sticky="w")
+        tk.Entry(custom_frame, textvariable=self.minutes_var, **entry_opts).grid(row=1, column=1, padx=6, pady=3, sticky="w")
+        tk.Button(custom_frame, text="<", command=lambda: self._adjust_int_var(self.minutes_var, -1, 1), **arrow_opts).grid(row=1, column=2, padx=2)
+        tk.Button(custom_frame, text=">", command=lambda: self._adjust_int_var(self.minutes_var, 1, 1), **arrow_opts).grid(row=1, column=3, padx=2)
+
+        tk.Label(custom_frame, text="Rounds:", **label_opts).grid(row=2, column=0, sticky="w")
+        tk.Entry(custom_frame, textvariable=self.rounds_var, **entry_opts).grid(row=2, column=1, padx=6, pady=3, sticky="w")
+        tk.Button(custom_frame, text="<", command=lambda: self._adjust_int_var(self.rounds_var, -1, 1), **arrow_opts).grid(row=2, column=2, padx=2)
+        tk.Button(custom_frame, text=">", command=lambda: self._adjust_int_var(self.rounds_var, 1, 1), **arrow_opts).grid(row=2, column=3, padx=2)
+
+        tk.Label(custom_frame, text="Fall speed:", **label_opts).grid(row=3, column=0, sticky="w")
+        tk.Entry(custom_frame, textvariable=self.fall_speed_var, **entry_opts).grid(row=3, column=1, padx=6, pady=3, sticky="w")
+        tk.Button(
+            custom_frame,
+            text="<",
+            command=lambda: self._adjust_float_var(self.fall_speed_var, -0.05, 0.05, 2.0),
+            **arrow_opts,
+        ).grid(row=3, column=2, padx=2)
+        tk.Button(
+            custom_frame,
+            text=">",
+            command=lambda: self._adjust_float_var(self.fall_speed_var, 0.05, 0.05, 2.0),
+            **arrow_opts,
+        ).grid(row=3, column=3, padx=2)
+
+        tk.Button(custom_frame, text="Start (Custom)", width=18, command=self.start_custom).grid(
+            row=0, column=4, rowspan=2, padx=12, pady=2, sticky="n"
+        )
+        tk.Button(custom_frame, text="Restart", width=18, command=self.restart_round).grid(
+            row=2, column=4, padx=12, pady=2, sticky="n"
+        )
+        tk.Button(custom_frame, text="Quit", width=18, command=self.quit_game).grid(
+            row=3, column=4, padx=12, pady=2, sticky="n"
+        )
+
+        status_frame = tk.LabelFrame(
+            self.root,
+            text="Status",
+            padx=8,
+            pady=8,
+            bg=self.ui_panel,
+            fg=self.ui_fg,
+            font=("Segoe UI", 9, "bold"),
+            bd=1,
+            relief="ridge",
+        )
+        status_frame.pack(fill="x", padx=10, pady=6)
+        tk.Label(
+            status_frame,
+            textvariable=self.status_var,
+            anchor="w",
+            justify="left",
+            bg=self.ui_panel,
+            fg=self.ui_accent,
+            font=("Segoe UI", 9, "bold"),
+        ).pack(fill="x")
+
+        hint = "Presets auto-start. Custom uses Bullets/Minutes/Rounds/Fall speed."
+        tk.Label(self.root, text=hint, fg=self.ui_muted, bg=self.ui_bg).pack(fill="x", padx=12, pady=(4, 8))
+
+        tk.Button(
+            self.root,
+            text="Settings",
+            width=8,
+            command=self._open_settings_window,
+            bg="#2b3d50",
+            fg=self.ui_fg,
+            activebackground="#365169",
+            activeforeground=self.ui_fg,
+            relief="flat",
+        ).place(relx=1.0, y=8, x=-8, anchor="ne")
+
+    def _open_settings_window(self):
+        if self.settings_window and self.settings_window.winfo_exists():
+            self.settings_window.lift()
+            self.settings_window.focus_force()
+            return
+
+        self.send_port_var.set(str(UDP_SEND_PORT))
+        self.recv_port_var.set(str(UDP_LISTEN_PORT))
+
+        win = tk.Toplevel(self.root)
+        self.settings_window = win
+        win.title("Network Settings")
+        win.geometry("330x180")
+        win.resizable(False, False)
+        win.configure(bg=self.ui_bg)
+        win.transient(self.root)
+
+        frame = tk.LabelFrame(
+            win,
+            text="Ports",
+            padx=10,
+            pady=10,
+            bg=self.ui_panel,
+            fg=self.ui_fg,
+            font=("Segoe UI", 9, "bold"),
+            bd=1,
+            relief="ridge",
+        )
+        frame.pack(fill="both", expand=True, padx=12, pady=10)
+
+        label_opts = {"bg": self.ui_panel, "fg": self.ui_fg, "font": ("Segoe UI", 9, "bold")}
+        entry_opts = {
+            "width": 12,
+            "bg": self.ui_panel_alt,
+            "fg": self.ui_fg,
+            "insertbackground": self.ui_fg,
+            "relief": "flat",
+            "highlightthickness": 1,
+            "highlightbackground": "#2e3f51",
+            "highlightcolor": self.ui_accent,
+        }
+
+        tk.Label(frame, text="Send Port:", **label_opts).grid(row=0, column=0, sticky="w", pady=4)
+        tk.Entry(frame, textvariable=self.send_port_var, **entry_opts).grid(row=0, column=1, sticky="w", pady=4, padx=(8, 0))
+
+        tk.Label(frame, text="Receive Port:", **label_opts).grid(row=1, column=0, sticky="w", pady=4)
+        tk.Entry(frame, textvariable=self.recv_port_var, **entry_opts).grid(row=1, column=1, sticky="w", pady=4, padx=(8, 0))
+
+        btn_row = tk.Frame(frame, bg=self.ui_panel)
+        btn_row.grid(row=2, column=0, columnspan=2, sticky="e", pady=(10, 2))
+        tk.Button(btn_row, text="Cancel", width=10, command=win.destroy).pack(side="right", padx=(6, 0))
+        tk.Button(btn_row, text="Save", width=10, command=self._save_network_settings).pack(side="right")
+
+    def _save_network_settings(self):
+        try:
+            send_port = int(self.send_port_var.get().strip())
+            recv_port = int(self.recv_port_var.get().strip())
+            if not (1 <= send_port <= 65535 and 1 <= recv_port <= 65535):
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Invalid ports", "Use integers in range 1-65535.")
+            return
+
+        try:
+            self.net.update_ports(send_port, recv_port)
+        except Exception as exc:
+            messagebox.showerror("Port update failed", f"Could not apply ports: {exc}")
+            return
+
+        CONFIG["send_port"] = send_port
+        CONFIG["recv_port"] = recv_port
+        _save_config(CONFIG)
+
+        self.status_var.set(f"Ports updated: send={send_port}, recv={recv_port}")
+        if self.settings_window and self.settings_window.winfo_exists():
+            self.settings_window.destroy()
+
+    def _adjust_int_var(self, var, delta, min_value=1, max_value=99):
+        try:
+            current = int(var.get().strip())
+        except Exception:
+            current = min_value
+        next_value = max(min_value, min(max_value, current + delta))
+        var.set(str(next_value))
+
+    def _adjust_float_var(self, var, delta, min_value=0.05, max_value=2.0):
+        try:
+            current = float(var.get().strip())
+        except Exception:
+            current = min_value
+        next_value = max(min_value, min(max_value, current + delta))
+        var.set(f"{next_value:.2f}")
+
+    def _build_stats_window(self):
+        self.stats_window = tk.Toplevel(self.root)
+        self.stats_window.title("Protect the car Live Stats")
+        self.stats_window.geometry("960x640")
+        self.stats_window.minsize(900, 600)
+        self.stats_window.resizable(True, True)
+        self.stats_window.protocol("WM_DELETE_WINDOW", self.stats_window.withdraw)
+        self.stats_window.configure(bg=self.ui_bg)
+
+        header = tk.Frame(self.stats_window, bg=self.ui_bg)
+        header.pack(fill="x", padx=14, pady=(14, 6))
+        tk.Label(
+            header,
+            text="Live Match Telemetry",
+            bg=self.ui_bg,
+            fg=self.ui_fg,
+            font=("Segoe UI", 28, "bold"),
+            anchor="w",
+        ).pack(anchor="w")
+        tk.Label(
+            header,
+            text="Real-time state, resources and pacing",
+            bg=self.ui_bg,
+            fg=self.ui_muted,
+            font=("Segoe UI", 16),
+            anchor="w",
+        ).pack(anchor="w")
+
+        grid = tk.Frame(self.stats_window, bg=self.ui_bg)
+        grid.pack(fill="both", expand=True, padx=12, pady=(4, 12))
+
+        self.stats_value_vars = {}
+        self.stats_value_labels = {}
+        card_defs = [
+            ("state", "STATE", "#5cc8ff"),
+            ("round", "ROUND", "#ffd166"),
+            ("hp", "HP", "#7bd389"),
+            ("time_left", "TIME LEFT", "#ff9f6e"),
+            ("players", "BULLETS", "#b392f0"),
+            ("bombs", "BOMBS", "#f28482"),
+            ("speed", "FALL SPEED", "#8ecae6"),
+            ("spawner", "SPAWNER", "#9ad47b"),
+        ]
+
+        for idx, (key, title, accent) in enumerate(card_defs):
+            row = idx // 2
+            col = idx % 2
+            card = tk.Frame(grid, bg=self.ui_panel, bd=1, relief="ridge")
+            card.grid(row=row, column=col, sticky="nsew", padx=7, pady=7)
+            grid.grid_columnconfigure(col, weight=1)
+            grid.grid_rowconfigure(row, weight=1)
+
+            top = tk.Frame(card, bg=self.ui_panel)
+            top.pack(fill="x", padx=14, pady=(10, 6))
+            tk.Label(top, text=title, bg=self.ui_panel, fg=self.ui_muted, font=("Segoe UI", 14, "bold")).pack(side="left")
+            tk.Label(top, text="●", bg=self.ui_panel, fg=accent, font=("Segoe UI", 16, "bold")).pack(side="right")
+
+            value_var = tk.StringVar(value="--")
+            self.stats_value_vars[key] = value_var
+            value_lbl = tk.Label(
+                card,
+                textvariable=value_var,
+                bg=self.ui_panel,
+                fg=self.ui_fg,
+                font=("Segoe UI", 26, "bold"),
+                anchor="w",
+                justify="left",
+                wraplength=420,
+            )
+            value_lbl.pack(fill="both", expand=True, padx=14, pady=(4, 16))
+            self.stats_value_labels[key] = value_lbl
+
+    def _set_custom_fields_from_preset(self, preset):
+        self.players_var.set(str(preset["num_players"]))
+        self.minutes_var.set(str(preset["mins"]))
+        self.rounds_var.set(str(preset["rounds"]))
+        self.fall_speed_var.set(f"{preset['fall_speed']:.2f}")
+
+    def _apply_start(self, num_players, minutes, rounds, fall_speed):
+        num_players = max(1, int(num_players))
+        minutes = max(1, int(minutes))
+        rounds = max(1, int(rounds))
+        fall_speed = max(0.05, float(fall_speed))
+
+        with self.game.lock:
+            self.game.round_duration_minutes = minutes
+            self.game.round_number = 1
+            self.game.total_rounds_to_survive = rounds
+            self.game.base_fall_speed = fall_speed
+            self.game.current_fall_speed = fall_speed
+
+        self.game.start_game(num_players)
+
+    def start_preset(self, key):
+        preset = DIFFICULTY_PRESETS[key]
+        self._set_custom_fields_from_preset(preset)
+        self._apply_start(preset["num_players"], preset["mins"], preset["rounds"], preset["fall_speed"])
+        self.status_var.set(f"Started preset: {key}")
+
+    def start_custom(self):
+        try:
+            num_players = int(self.players_var.get().strip())
+            minutes = int(self.minutes_var.get().strip())
+            rounds = int(self.rounds_var.get().strip())
+            fall_speed = float(self.fall_speed_var.get().strip())
+            self._apply_start(num_players, minutes, rounds, fall_speed)
+            self.status_var.set(
+                f"Started custom: bullets={max(1, num_players)}, mins={max(1, minutes)}, rounds={max(1, rounds)}, speed={max(0.05, fall_speed):.2f}"
+            )
+        except ValueError:
+            messagebox.showerror("Invalid values", "Use numeric values: bullets, minutes, rounds, fall speed.")
+
+    def restart_round(self):
+        self.game.restart_round()
+        self.status_var.set("Round restarted")
+
+    def _schedule_stats_update(self):
+        self._update_stats()
+        if self.game.running:
+            self.root.after(200, self._schedule_stats_update)
+
+    def _update_stats(self):
+        with self.game.lock:
+            state = self.game.state
+            round_no = self.game.round_number
+            round_total = self.game.total_rounds_to_survive
+            hp = PresidentialVehicle.global_points
+            hp_max = PresidentialVehicle.global_points_default
+
+            total_players = len(self.game.players)
+            active_players = sum(1 for p in self.game.players if p.piece and p.piece.active)
+            waiting_players = sum(1 for p in self.game.players if p.respawn_time > 0)
+            bombs = len(self.game.bombs)
+            speed = self.game.current_fall_speed
+            spawner = f"{self.game.next_spawn_index}/{len(self.game.players)}"
+
+            time_left_text = "--"
+            if self.game.round_start_time is not None and self.game.round_duration_minutes > 0:
+                total_sec = self.game.round_duration_minutes * 60
+                left = max(0, int(total_sec - (time.time() - self.game.round_start_time)))
+                mm = left // 60
+                ss = left % 60
+                time_left_text = f"{mm:02d}:{ss:02d}"
+
+        self.stats_value_vars["state"].set(state)
+        self.stats_value_vars["round"].set(f"{round_no}/{round_total}")
+        self.stats_value_vars["hp"].set(f"{hp}/{hp_max}")
+        self.stats_value_vars["players"].set(f"{total_players} total, {active_players} active, {waiting_players} waiting")
+        self.stats_value_vars["bombs"].set(str(bombs))
+        self.stats_value_vars["speed"].set(f"{speed:.2f}")
+        self.stats_value_vars["time_left"].set(time_left_text)
+        self.stats_value_vars["spawner"].set(spawner)
+
+        hp_ratio = (hp / hp_max) if hp_max else 0.0
+        hp_color = "#ff6961" if hp_ratio <= 0.30 else ("#ffd166" if hp_ratio <= 0.60 else "#7bd389")
+        self.stats_value_labels["hp"].configure(fg=hp_color)
+
+        state_colors = {
+            "LOBBY": "#5cc8ff",
+            "COUNTDOWN": "#ffd166",
+            "PLAYING": "#7bd389",
+            "PREWIN_FLICKER": "#ffcf6e",
+            "WIN": "#7bed9f",
+            "GAMEOVER": "#ff6b6b",
+        }
+        self.stats_value_labels["state"].configure(fg=state_colors.get(state, self.ui_fg))
+
+    def quit_game(self):
+        self.game.running = False
+        self.net.running = False
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
+    def run(self):
+        self.root.mainloop()
+
 if __name__ == "__main__":
     game = PresidentGame()
     net = NetworkManager(game)
@@ -2544,35 +3065,40 @@ if __name__ == "__main__":
     gt.daemon = True
     gt.start()
 
-    print("jocu lu mucusor Console Server Running.")
-    print("Commands: 'start <num_players> <mins_playtime> <rounds_to_survive>', 'restart', 'quit'")
+    if TK_AVAILABLE:
+        print("Launching desktop UI...")
+        ui = GameControlUI(game, net)
+        ui.run()
+    else:
+        print("Tkinter not available. Falling back to console controls.")
+        print("Commands: 'start <num_bullets> <mins_playtime> <rounds_to_survive>', 'restart', 'quit'")
 
-    try:
-        while game.running:
-            cmd = input("> ").strip().lower()
-            if cmd == 'quit' or cmd == 'exit':
-                game.running = False
-                break
-            elif cmd.startswith('start'):
-                parts = cmd.split()
-                if len(parts) >= 4 and parts[1].isdigit() and parts[2].isdigit() and parts[3].isdigit():
-                    num_players = int(parts[1])
-                    mins_playtime = int(parts[2])
-                    rounds_to_survive = max(1, int(parts[3]))
+        try:
+            while game.running:
+                cmd = input("> ").strip().lower()
+                if cmd == 'quit' or cmd == 'exit':
+                    game.running = False
+                    break
+                elif cmd.startswith('start'):
+                    parts = cmd.split()
+                    if len(parts) >= 4 and parts[1].isdigit() and parts[2].isdigit() and parts[3].isdigit():
+                        num_players = int(parts[1])
+                        mins_playtime = int(parts[2])
+                        rounds_to_survive = max(1, int(parts[3]))
 
-                    game.round_duration_minutes = mins_playtime
-                    game.round_number = 1
-                    game.total_rounds_to_survive = rounds_to_survive
-                    game.start_game(num_players)
+                        game.round_duration_minutes = mins_playtime
+                        game.round_number = 1
+                        game.total_rounds_to_survive = rounds_to_survive
+                        game.start_game(num_players)
+                    else:
+                        print("Usage: start <num_bullets> <mins_playtime> <rounds_to_survive>")
+                elif cmd == 'restart':
+                    game.restart_round()
+                    print("Restarted round.")
                 else:
-                    print("Usage: start <num_players> <mins_playtime> <rounds_to_survive>")
-            elif cmd == 'restart':
-                game.restart_round()
-                print("Restarted round.")
-            else:
-                print("Unknown command.")
-    except KeyboardInterrupt:
-        game.running = False
+                    print("Unknown command.")
+        except KeyboardInterrupt:
+            game.running = False
 
     net.running = False
     print("Exiting...")
