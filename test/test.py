@@ -34,6 +34,7 @@ try:
 except ImportError:
     PYGAME_AVAILABLE = False
 
+<<<<<<< HEAD
 def _ensure_mido_installed():
     """Fast one-time check/install for mido on startup."""
     if importlib.util.find_spec("mido") is not None:
@@ -66,6 +67,13 @@ def _ensure_mido_installed():
     return False
 
 MIDO_AVAILABLE = _ensure_mido_installed()
+=======
+try:
+    import winsound
+    WINSOUND_AVAILABLE = True
+except ImportError:
+    WINSOUND_AVAILABLE = False
+>>>>>>> ciprian
 
 # --- Sample-based Piano (uses real piano samples) ---
 SEMITONE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
@@ -175,18 +183,6 @@ class SampleBank:
             self._cache[midi] = self._pitch_shift(self._raw[nearest], semitones)
         return (self._cache[midi] * velocity).astype(np.float32)
 
-# Debug log file
-_DEBUG_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "piano_debug.log")
-def _debug_log(msg):
-    """Write debug message to file and print"""
-    print(msg, flush=True)
-    try:
-        with open(_DEBUG_LOG_FILE, 'a') as f:
-            f.write(msg + '\n')
-            f.flush()
-    except:
-        pass
-
 # --- Configuration ---
 _CFG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tetris_config.json")
 
@@ -278,7 +274,6 @@ def calculate_checksum(data):
 class PianoController:
     """Manages piano note mapping and sound generation for button presses"""
     def __init__(self):
-        print("[PIANO] Initializing PianoController", flush=True)
         self.note_frequencies = self._generate_note_frequencies()
         self.button_to_note = self._map_buttons_to_notes()
         self.prev_button_states = {}
@@ -295,31 +290,25 @@ class PianoController:
             piano_sample_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "samples")
             if os.path.exists(piano_sample_dir) and NUMPY_AVAILABLE and HAS_SCIPY:
                 self.sample_bank = SampleBank(piano_sample_dir)
-                print(f"[PIANO] Using real piano samples from {piano_sample_dir}", flush=True)
             else:
-                if not os.path.exists(piano_sample_dir):
-                    print(f"[PIANO] Sample directory not found at {piano_sample_dir}", flush=True)
+                pass
         except Exception as e:
-            print(f"[PIANO] Failed to load sample bank: {e}", flush=True)
+            print(f"Failed to load sample bank: {e}", flush=True)
             self.sample_bank = None
         
         # Build piano keyboard mapping on both sides.
         self._build_piano_column_mapping()
-        
-        print(f"[PIANO] PYGAME_AVAILABLE = {PYGAME_AVAILABLE}", flush=True)
         
         if PYGAME_AVAILABLE:
             try:
                 pygame.mixer.init()
                 pygame.mixer.set_num_channels(64)
                 self.mixer_available = True
-                print("[PIANO] Pygame mixer initialized successfully", flush=True)
             except Exception as e:
                 self.mixer_available = False
-                print(f"[PIANO] Pygame mixer init failed: {e}", flush=True)
+                print(f"Pygame mixer init failed: {e}", flush=True)
         else:
             self.mixer_available = False
-            print("[PIANO] Pygame not available", flush=True)
 
     def _build_piano_column_mapping(self):
         """
@@ -331,11 +320,6 @@ class PianoController:
         left_columns_x = [2]
         right_columns_x = [BOARD_WIDTH - 3]
         note_count = min(len(self.note_frequencies), BOARD_HEIGHT)
-
-        print(
-            f"[PIANO] Building vertical piano column mapping (left x={left_columns_x}, right x={right_columns_x})",
-            flush=True
-        )
 
         for note_idx in range(note_count):
             # y goes from bottom to top, so pitch rises as y decreases.
@@ -351,10 +335,7 @@ class PianoController:
                 self._button_to_note_index[right_button_idx] = note_idx
                 self._button_side_map[right_button_idx] = "right"
 
-        print(
-            f"[PIANO] Mapped both sides: {note_count} notes per side, 2 columns each side ({len(self._button_to_note_index)} total button indices)",
-            flush=True
-        )
+        
 
     def _get_led_index(self, x, y):
         """Convert (x, y) board position to LED/button index (same logic as Player.get_led_index)"""
@@ -540,11 +521,10 @@ class PianoController:
                     sustain_channel.play(sound)
                     self.active_hold_channels[button_idx] = sustain_channel
                     self.active_hold_started_at[button_idx] = time.time()
-                    print(f"[PIANO] Playing sample for MIDI {midi_note}", flush=True)
                 else:
                     raise RuntimeError("Empty audio data from sample bank")
             except Exception as e:
-                print(f"[PIANO] Sample playback failed: {e}, using synthetic fallback", flush=True)
+                print(f"Sample playback failed: {e}, using synthetic fallback", flush=True)
                 self._start_held_note_synthetic(button_idx, note_idx, freq)
         else:
             # No sample bank, use synthetic tone
@@ -574,7 +554,7 @@ class PianoController:
                 self.active_hold_channels[button_idx] = sustain_channel
                 self.active_hold_started_at[button_idx] = time.time()
             except Exception as e:
-                print(f"[PIANO] Synthetic hold note start failed: {e}", flush=True)
+                print(f"Synthetic hold note start failed: {e}", flush=True)
                 self.play_note(freq, duration=0.70)
         else:
             self.play_note(freq, duration=0.70)
@@ -614,9 +594,7 @@ class PianoController:
         
         def _play():
             try:
-                print(f"[PIANO] Generating tone: {frequency:.2f} Hz for {duration}s")
                 audio_data = self._generate_piano_tone(frequency, duration, vol=0.50)
-                print(f"[PIANO] Audio data generated: {len(audio_data)} bytes")
                 
                 if self.mixer_available and len(audio_data) > 0:
                     # Use pygame mixer
@@ -629,16 +607,13 @@ class PianoController:
                             channel.play(sound)
                         else:
                             sound.play()
-                        print(f"[PIANO] Playing via pygame mixer")
                     except Exception as mixer_err:
-                        print(f"[PIANO] Mixer playback failed: {mixer_err}, trying wave...")
                         self._play_audio_wave(audio_data)
                 else:
                     # Fallback: save and play using wave
-                    print(f"[PIANO] Using wave playback")
                     self._play_audio_wave(audio_data)
             except Exception as e:
-                print(f"[PIANO] Error playing note: {e}")
+                print(f"Error playing note: {e}")
         
         thread = threading.Thread(target=_play, daemon=True)
         thread.start()
@@ -652,23 +627,23 @@ class PianoController:
             temp_dir = tempfile.gettempdir()
             temp_file = os.path.join(temp_dir, "piano_note.wav")
             
-            print(f"[PIANO] Writing to {temp_file}")
             with wave.open(temp_file, 'w') as f:
                 f.setnchannels(1)
                 f.setsampwidth(1)  # 8-bit audio
                 f.setframerate(44100)
                 f.writeframes(bytes(audio_data))
             
-            print(f"[PIANO] Playing {temp_file}")
             # Try to play using available method
             if os.name == 'nt':  # Windows
-                os.startfile(temp_file)
-                print(f"[PIANO] Started playback via os.startfile")
+                if WINSOUND_AVAILABLE:
+                    winsound.PlaySound(temp_file, winsound.SND_FILENAME | winsound.SND_ASYNC)
+                else:
+                    # Last-resort fallback when winsound is unavailable
+                    os.startfile(temp_file)
             else:  # Linux/Mac
-                os.system(f'aplay {temp_file}')  # or 'afplay' on Mac
-                print(f"[PIANO] Started playback via aplay")
+                os.system(f"aplay '{temp_file}'")
         except Exception as e:
-            print(f"[PIANO] Wave playback failed: {e}")
+            print(f"Wave playback failed: {e}")
 
     def handle_button_press(self, button_states, player_button_map=None):
         """
@@ -680,20 +655,17 @@ class PianoController:
         # First, check if any unmapped button (empty area) is pressed.
         # If so, stop all active holds immediately (user moved away from keyboard).
         for button_idx in range(len(button_states)):
-            if button_states[button_idx] and button_idx not in self._button_to_note_index:
+            if button_idx not in self._button_to_note_index:
+                is_pressed = button_states[button_idx]
                 was_pressed = self.prev_button_states.get(button_idx, False)
-                if not was_pressed:
-                    # New press on unmapped area -> release all holds
+                if is_pressed and not was_pressed and self.active_hold_channels:
                     for held_button in list(self.active_hold_channels.keys()):
                         self._stop_held_note(held_button)
-                    if self.active_hold_channels:
-                        print(f"[PIANO] Unmapped button {button_idx} pressed -> stopping all holds", flush=True)
 
         for button_idx, note_idx in self._button_to_note_index.items():
             is_pressed = button_states[button_idx] if button_idx < len(button_states) else False
             was_pressed = self.prev_button_states.get(button_idx, False)
 
-            # New press -> start note and keep it held.
             if is_pressed and not was_pressed:
                 if note_idx < len(self.note_frequencies):
                     # Stop any other button already playing the same note
@@ -701,15 +673,11 @@ class PianoController:
                         other_note_idx = self._button_to_note_index.get(other_button_idx)
                         if other_note_idx == note_idx:
                             self._stop_held_note(other_button_idx)
-                            print(f"[PIANO] Stopped duplicate note on button {other_button_idx}", flush=True)
                     
                     freq = self.note_frequencies[note_idx]
-                    note_name = self._get_note_name(note_idx)
-                    print(f"[PIANO] Hold start: Button {button_idx} -> {note_name} ({freq:.2f} Hz)", flush=True)
                     self._start_held_note(button_idx, note_idx, freq)
                     pressed_started += 1
 
-            # Release -> stop held note.
             elif (not is_pressed) and was_pressed:
                 self._stop_held_note(button_idx)
                 released_count += 1
@@ -719,10 +687,6 @@ class PianoController:
             is_pressed = button_states[button_idx] if button_idx < len(button_states) else False
             if not is_pressed and button_idx in self.active_hold_started_at:
                 self._stop_held_note(button_idx)
-                print(f"[PIANO] Stopped stale hold on button {button_idx} (button state says not pressed)", flush=True)
-
-        if pressed_started or released_count:
-            print(f"[PIANO] Changes: started={pressed_started}, released={released_count}", flush=True)
 
         # Update previous state snapshot.
         self.prev_button_states = {i: button_states[i] for i in range(len(button_states))}
@@ -769,8 +733,6 @@ class MidiSongPlayer:
         self.finished = False
         self._current_elapsed = 0.0
         self._update_counter = 0
-        self._debug_last_spawn_log = -1
-        self._debug_last_pending_head = None
         self._load_midi(midi_path)
         self._reset_song_state()
 
@@ -787,10 +749,7 @@ class MidiSongPlayer:
     def _load_midi(self, path):
         try:
             import mido
-            print(f"[MIDI] Python executable: {sys.executable}", flush=True)
-            print(f"[MIDI] mido version: {getattr(mido, '__version__', 'unknown')}", flush=True)
         except ImportError:
-            print(f"[MIDI] mido missing for python={sys.executable}. Trying auto-install...", flush=True)
             try:
                 result = subprocess.run(
                     [sys.executable, "-m", "pip", "install", "mido"],
@@ -799,15 +758,11 @@ class MidiSongPlayer:
                     timeout=60,
                 )
                 if result.returncode != 0:
-                    print(f"[MIDI] Auto-install failed (code {result.returncode})", flush=True)
-                    if result.stderr:
-                        print(f"[MIDI] pip stderr: {result.stderr[-300:]}", flush=True)
                     return
 
                 import mido
-                print(f"[MIDI] Auto-install OK. mido version: {getattr(mido, '__version__', 'unknown')}", flush=True)
             except Exception as e:
-                print(f"[MIDI] Auto-install exception: {e}", flush=True)
+                print(f"MIDI auto-install failed: {e}", flush=True)
                 return
 
         mid = mido.MidiFile(path)
@@ -838,43 +793,20 @@ class MidiSongPlayer:
 
         parsed_notes.sort(key=lambda n: n['spawn_time'])
         self.all_notes = parsed_notes
-        print(f"[MIDI] Loaded {len(self.all_notes)} notes from {path}", flush=True)
-        if self.all_notes:
-            first_spawn = self.all_notes[0]['spawn_time']
-            last_spawn = self.all_notes[-1]['spawn_time']
-            print(
-                f"[MIDI] Spawn window: first={first_spawn:.3f}s last={last_spawn:.3f}s lead={lead_time:.3f}s tempo_scale={self.TEMPO_SCALE}",
-                flush=True,
-            )
-            print(
-                f"[MIDI] First note preview: play={self.all_notes[0]['play_time']:.3f}s row={self.all_notes[0]['row']} idx={self.all_notes[0]['note_idx']}",
-                flush=True,
-            )
-        else:
-            print("[MIDI] WARNING: No note_on events were parsed from MIDI", flush=True)
 
     def start(self):
         # Safety: if note cache is empty for any reason, retry loading now.
         if not self.all_notes:
             try:
                 file_exists = os.path.exists(self.midi_path)
-                file_size = os.path.getsize(self.midi_path) if file_exists else -1
-                print(
-                    f"[MIDI] WARNING start() with empty all_notes. Reloading path={self.midi_path} exists={file_exists} size={file_size}",
-                    flush=True,
-                )
                 if file_exists:
                     self._load_midi(self.midi_path)
             except Exception as e:
-                print(f"[MIDI] ERROR during start() reload: {e}", flush=True)
+                print(f"MIDI reload error: {e}", flush=True)
 
         self._reset_song_state()
         self.start_time = time.time()
         self.song_started = True
-        print(
-            f"[MIDI] Song playback started | all_notes={len(self.all_notes)} pending={len(self.pending_notes)} flying={len(self.flying_notes)}",
-            flush=True,
-        )
 
     def update(self):
         """Call once per frame to advance note positions."""
@@ -904,30 +836,6 @@ class MidiSongPlayer:
                 'spawn_time': n['spawn_time'], 'play_time': n['play_time'],
                 'phase': 'fade', 'target_x': self.TARGET_COL_RIGHT, 'dx': self.MOVE_SPEED,
             })
-
-        if queued_this_frame > 0 or spawned_this_frame > 0:
-            print(
-                f"[MIDI DBG] frame={self._update_counter} elapsed={elapsed:.3f}s queued={queued_this_frame} spawned={spawned_this_frame} queue={len(self.spawn_queue)} pending={len(self.pending_notes)} flying={len(self.flying_notes)}",
-                flush=True,
-            )
-
-        # Heartbeat log every ~1s at 20 FPS.
-        if self._update_counter % 20 == 0:
-            next_spawn = self.pending_notes[0]['spawn_time'] if self.pending_notes else None
-            if next_spawn is not None:
-                until_next = next_spawn - elapsed
-                next_head = f"{next_spawn:.3f}"
-            else:
-                until_next = None
-                next_head = "none"
-
-            if self._debug_last_pending_head != next_head:
-                self._debug_last_pending_head = next_head
-
-            print(
-                f"[MIDI DBG] heartbeat frame={self._update_counter} elapsed={elapsed:.3f}s pending={len(self.pending_notes)} queue={len(self.spawn_queue)} flying={len(self.flying_notes)} next_spawn={next_head} in={until_next if until_next is None else round(until_next, 3)}",
-                flush=True,
-            )
 
         self._current_elapsed = elapsed
 
@@ -965,10 +873,6 @@ class MidiSongPlayer:
         # Mark as finished when nothing is left
         if not self.pending_notes and not self.spawn_queue and not self.flying_notes:
             self.finished = True
-            print(
-                f"[MIDI] Song finished at elapsed={elapsed:.3f}s frame={self._update_counter}",
-                flush=True,
-            )
 
     def get_flying_notes(self):
         """Return two-phase guide notes: fade at center, then move outward."""
@@ -1078,17 +982,15 @@ class TestGame:
             mid_files = [f for f in os.listdir(test_dir) if f.lower().endswith('.mid')]
             if mid_files:
                 midi_path = os.path.join(test_dir, mid_files[0])
-                print(f"[MIDI] Found MIDI file: {mid_files[0]}", flush=True)
             else:
                 midi_path = None
         if midi_path and os.path.exists(midi_path):
             try:
                 self.midi_player = MidiSongPlayer(midi_path, self.piano)
-                print(f"[MIDI] Song loaded: {midi_path}", flush=True)
             except Exception as e:
-                print(f"[MIDI] Failed to load song: {e}", flush=True)
+                print(f"Failed to load MIDI song: {e}", flush=True)
         else:
-            print(f"[MIDI] No .mid files found in {test_dir}", flush=True)
+            pass
 
     def _build_player_button_map(self, row_groups_left, row_groups_right, left_edge, right_edge):
         """Build 10-player button map from row-group bands.
@@ -1266,22 +1168,10 @@ class TestGame:
 
             if self.state == 'PLAYING':
                 # Handle piano note generation from button presses
-                if not hasattr(self, '_debug_tick_counter'):
-                    self._debug_tick_counter = 0
-                    _debug_log("[GAME] PLAYING state activated, piano handler starting")
-                    
-                self._debug_tick_counter += 1
-                
-                # Every 50 ticks, log button state info
-                if self._debug_tick_counter % 50 == 0:
-                    pressed_count = sum(1 for b in self.button_states if b)
-                    pressed_indices = [i for i, b in enumerate(self.button_states) if b]
-                    _debug_log(f"[TICK {self._debug_tick_counter}] Buttons: {pressed_count} pressed, indices={pressed_indices[:10]}")
-                
                 try:
                     self.piano.handle_button_press(self.button_states, self.player_button_map)
                 except Exception as e:
-                    _debug_log(f"[TICK ERROR] Exception in piano.handle_button_press: {e}")
+                    print(f"Tick error in piano.handle_button_press: {e}")
                     import traceback
                     traceback.print_exc()
 
@@ -1443,19 +1333,13 @@ class NetworkManager:
             pass
 
     def recv_loop(self):
-        if not hasattr(self, '_debug_packet_count'):
-            self._debug_packet_count = 0
-            self._debug_valid_count = 0
-        
         while self.running:
             try:
                 data, addr = self.sock_recv.recvfrom(2048)
-                self._debug_packet_count += 1
 
                 # Simulator packets contain per-channel touch bytes in 171-byte blocks.
                 # Parse all channels so taps from upper and lower matrix are both visible.
                 if len(data) >= 1264 and data[0] == 0x88:
-                    self._debug_valid_count += 1
                     new_states = [False] * MATRIX_TOUCH_COUNT
 
                     for channel in range(MATRIX_TOUCH_CHANNELS):
@@ -1467,26 +1351,14 @@ class NetworkManager:
                                 new_states[dst_idx] = (data[source_idx] == 0xCC)
 
                     with self.game.lock:
-                        # Auto-start game when buttons are first pressed in LOBBY
                         if self.game.state == 'LOBBY' and any(new_states):
-                            print(f"[AUTO-START] Buttons detected, starting game!", flush=True)
                             self.game.start_game()
                         
                         self.game.button_states = new_states
                         self.prev_button_states = self.game.button_states.copy()
-                    
-                    # Debug: print every 20 valid packets
-                    if self._debug_valid_count % 20 == 0:
-                        pressed_count = sum(1 for b in new_states if b)
-                        pressed_indices = [i for i, b in enumerate(new_states) if b]
-                        print(f"[RECV] Packet {self._debug_valid_count}: {pressed_count} buttons pressed at {pressed_indices[:3]}", flush=True)
-                else:
-                    # Unexpected packet format
-                    if self._debug_packet_count % 20 == 0:
-                        print(f"[RECV] {self._debug_packet_count} packets received, {self._debug_valid_count} valid. Last packet: len={len(data)}, first_byte=0x{data[0]:02x if len(data)>0 else 0}")
 
             except Exception as e:
-                print(f"[RECV ERROR] {e}")
+                print(f"Receive error: {e}")
 
     def start_bg(self):
         t1 = threading.Thread(target=self.send_loop)
