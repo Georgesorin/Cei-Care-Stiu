@@ -208,12 +208,170 @@ class Player:
         self.next_shape_key = random.choice(list(SHAPES.keys()))
         # Use safe spawn
         if hasattr(self, 'game') and hasattr(self.game, '_find_safe_spawn'):
-            spawn_x, spawn_y = self.game._find_safe_spawn(include_dynamic=True)
+            spawn_x, spawn_y = self.game._find_safe_spawn(include_dynamic=True, prefer_cop_edges=True)
         else:
             spawn_x = random.randint(0, BOARD_WIDTH - 1)
             spawn_y = random.randint(0, BOARD_HEIGHT - 1)
         self.piece = PresidentialVehicle(shape_key, self.color, spawn_x, spawn_y)
         self.last_progress_time = time.time()
+
+
+class SoundManager:
+    def __init__(self, base_dir):
+        self.enabled = False
+        self.hit_sound = None
+        self.ambient_sound = None
+        self.ambient_channel = None
+
+        if not PYGAME_AVAILABLE:
+            return
+
+        try:
+            if not pygame.mixer.get_init():
+                pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=256)
+
+            candidates = [
+                os.path.join(base_dir, "hit.wav"),
+                os.path.join(base_dir, "_sfx", "hit.wav"),
+                os.path.join(os.path.dirname(base_dir), "_sfx", "hit.wav"),
+                os.path.join(os.getcwd(), "hit.wav"),
+                os.path.join(os.getcwd(), "_sfx", "hit.wav"),
+            ]
+
+            hit_path = next((path for path in candidates if os.path.exists(path)), None)
+            if not hit_path:
+                print("Audio note: hit.wav not found; hit sound disabled.")
+            else:
+                self.hit_sound = pygame.mixer.Sound(hit_path)
+                self.hit_sound.set_volume(0.35)
+
+            ambient_candidates = [
+                os.path.join(base_dir, "main_ambient.wav"),
+                os.path.join(base_dir, "_sfx", "main_ambient.wav"),
+                os.path.join(os.path.dirname(base_dir), "_sfx", "main_ambient.wav"),
+                os.path.join(os.getcwd(), "main_ambient.wav"),
+                os.path.join(os.getcwd(), "_sfx", "main_ambient.wav"),
+                os.path.join(base_dir, "main_ambient.mp3"),
+                os.path.join(base_dir, "_sfx", "main_ambient.mp3"),
+                os.path.join(os.getcwd(), "main_ambient.mp3"),
+                os.path.join(os.getcwd(), "_sfx", "main_ambient.mp3"),
+            ]
+            ambient_path = next((p for p in ambient_candidates if os.path.exists(p)), None)
+            if not ambient_path:
+                print("Audio note: main_ambient not found; lobby ambient disabled.")
+            else:
+                self.ambient_sound = pygame.mixer.Sound(ambient_path)
+
+            def _load_sfx(name):
+                exts = [".wav", ".mp3"]
+                dirs = [base_dir, os.path.join(base_dir, "_sfx"),
+                        os.path.join(os.path.dirname(base_dir), "_sfx"), os.getcwd(),
+                        os.path.join(os.getcwd(), "_sfx")]
+                for d in dirs:
+                    for ext in exts:
+                        p = os.path.join(d, name + ext)
+                        if os.path.exists(p):
+                            return p
+                return None
+
+            self.countdown_sound = None
+            ct_path = _load_sfx("countdown_tick")
+            if ct_path:
+                self.countdown_sound = pygame.mixer.Sound(ct_path)
+                self.countdown_sound.set_volume(0.35)
+            else:
+                print("Audio note: countdown_tick not found; countdown sound disabled.")
+
+            self.spawn_sound = None
+            sp_path = _load_sfx("spawn")
+            if sp_path:
+                self.spawn_sound = pygame.mixer.Sound(sp_path)
+                self.spawn_sound.set_volume(0.3)
+            else:
+                print("Audio note: spawn not found; spawn sound disabled.")
+
+            self.win_sound = None
+            win_path = _load_sfx("win")
+            if win_path:
+                self.win_sound = pygame.mixer.Sound(win_path)
+                self.win_sound.set_volume(0.3)
+            else:
+                print("Audio note: win not found; win sound disabled.")
+
+            self.loss_sound = None
+            loss_path = _load_sfx("loss")
+            if loss_path:
+                self.loss_sound = pygame.mixer.Sound(loss_path)
+                self.loss_sound.set_volume(0.3)
+            else:
+                print("Audio note: loss not found; loss sound disabled.")
+
+            self.enabled = True
+        except Exception as exc:
+            print(f"Audio init failed: {exc}")
+            self.enabled = False
+
+    def play_ambient(self):
+        if not self.enabled or not self.ambient_sound:
+            return
+        try:
+            if self.ambient_channel and self.ambient_channel.get_busy():
+                return  # already playing
+            self.ambient_sound.set_volume(0.30)
+            self.ambient_channel = self.ambient_sound.play(loops=-1)
+        except Exception:
+            pass
+
+    def stop_ambient(self):
+        if not self.enabled or not self.ambient_sound:
+            return
+        try:
+            if self.ambient_channel:
+                self.ambient_channel.stop()
+            else:
+                self.ambient_sound.stop()
+        except Exception:
+            pass
+
+    def play_countdown_tick(self):
+        if not self.enabled or not self.countdown_sound:
+            return
+        try:
+            self.countdown_sound.play()
+        except Exception:
+            pass
+
+    def play_spawn(self):
+        if not self.enabled or not self.spawn_sound:
+            return
+        try:
+            self.spawn_sound.play()
+        except Exception:
+            pass
+
+    def play_hit(self):
+        if not self.enabled or not self.hit_sound:
+            return
+        try:
+            self.hit_sound.play()
+        except Exception:
+            pass
+
+    def play_win(self):
+        if not self.enabled or not self.win_sound:
+            return
+        try:
+            self.win_sound.play()
+        except Exception:
+            pass
+
+    def play_loss(self):
+        if not self.enabled or not self.loss_sound:
+            return
+        try:
+            self.loss_sound.play()
+        except Exception:
+            pass
 
 class PresidentGame:
     def apply_color_scheme(self):
@@ -225,6 +383,7 @@ class PresidentGame:
         self.obstacle_color = next_scheme['obstacle']
 
     def __init__(self):
+        self.sound = SoundManager(os.path.dirname(os.path.abspath(__file__)))
         self.board = [[BLACK for _ in range(BOARD_WIDTH)] for _ in range(BOARD_HEIGHT)]
         self.players = []
 
@@ -264,24 +423,25 @@ class PresidentGame:
 
         # --- Obstacle maps (positions for tree-like obstacles, full grid) ---
         candidate_maps = [
-            # Center zig-zag gates
-            [(7, 4), (8, 8), (7, 12), (8, 16), (7, 20), (8, 24), (7, 28)],
-            # Two sparse side lanes
-            [(3, 5), (12, 5), (3, 12), (12, 12), (3, 19), (12, 19), (3, 26), (12, 26)],
-            # Wide checker anchors
-            [(4, 6), (10, 6), (7, 11), (4, 16), (10, 16), (7, 21), (4, 26), (10, 26)],
-            # Offset pillars
-            [(2, 8), (7, 8), (12, 8), (4, 16), (9, 16), (2, 24), (7, 24), (12, 24)],
-            # Open cross sections
-            [(5, 4), (10, 4), (7, 10), (2, 16), (13, 16), (7, 22), (5, 28), (10, 28)],
-            # Procedural playable candidates
-            generate_spread_obstacles(6, min_distance=5),
-            generate_spread_obstacles(7, min_distance=5),
-            generate_spread_obstacles(8, min_distance=5),
+            # Center zig-zag gates.
+            [(7, 10), (8, 12), (7, 14), (8, 16), (7, 18), (8, 20), (7, 22)],
+            # Inner box clusters.
+            [(5, 11), (10, 11), (5, 16), (10, 16), (5, 21), (10, 21), (7, 14), (8, 18)],
+            # Middle diamonds.
+            [(7, 11), (6, 14), (8, 14), (5, 17), (9, 17), (6, 20), (8, 20), (7, 23)],
+            # Offset center pillars.
+            [(6, 10), (9, 12), (6, 15), (9, 17), (6, 20), (9, 22)],
+            # Procedural playable candidates (middle zone only).
+            self._generate_middle_obstacles(6, min_distance=5),
+            self._generate_middle_obstacles(7, min_distance=5),
+            self._generate_middle_obstacles(8, min_distance=5),
         ]
         self.obstacle_maps = self._build_playable_maps(candidate_maps, desired_count=10)
         self.obstacle_color = (64, 64, 64)  # dark gray
         self.current_obstacle_map = []
+        self.cop_spawn_points = self._build_cop_spawn_points()
+        self.cop_move_interval = 10.0
+        self.last_cop_move_time = time.time()
 
         # Motion trail for smooth visuals
         self.trail = [[0.0 for _ in range(BOARD_WIDTH)] for _ in range(BOARD_HEIGHT)]
@@ -310,10 +470,12 @@ class PresidentGame:
         self.big_cube_speed = 0.6  # seconds per move
         self.big_cube_last_move = time.time()
         self.big_cube_direction = random.choice([(0,1),(0,-1),(1,0),(-1,0)])
-        self.big_cube_turn_interval = random.uniform(0.5, 2)
         self.big_cube_last_turn = time.time()
         self.big_cube_last_progress = time.time()
         self.big_cube_stuck_timeout = 5.0
+        self.big_cube_recovering = False
+        self.big_cube_recover_forward = (1, 0)
+        self.big_cube_recover_side_dx = -1
 
         self.round_duration_minutes = 1  # default, will be set at start
         self.total_rounds_to_survive = 1
@@ -331,6 +493,9 @@ class PresidentGame:
         self.color_transition_active = False
         self.color_transition_start = 0.0
         self.color_transition_duration = 1.2
+
+        # Start ambient music for the lobby.
+        self.sound.play_ambient()
 
     def _blend_color(self, color_a, color_b, t):
         t = max(0.0, min(1.0, t))
@@ -364,6 +529,7 @@ class PresidentGame:
 
         p.hits_taken += 1
         points_left = PresidentialVehicle.apply_hit()
+        self.sound.play_hit()
         if p.piece:
             p.piece.active = False
 
@@ -386,6 +552,7 @@ class PresidentGame:
             self.state = 'GAMEOVER'
             self.game_over_timer = time.time()
             self.winner_player = None
+            self.sound.play_loss()
 
     def _determine_winner_by_hits(self):
         if not self.players:
@@ -400,6 +567,7 @@ class PresidentGame:
             self.state = 'PREWIN_FLICKER'
             self.prewin_flicker_start = time.time()
             self.winner_player = None
+            self.sound.play_win()
             print(f"Victory! Car survived all {self.total_rounds_to_survive} rounds.")
             return
 
@@ -417,6 +585,170 @@ class PresidentGame:
                 if 0 <= nx < BOARD_WIDTH and 0 <= ny < BOARD_HEIGHT:
                     self.board[ny][nx] = self.obstacle_color
 
+    def _is_middle_zone(self, x, y):
+        return 4 <= x <= 11 and 8 <= y <= 23
+
+    def _edge_loop_bounds(self):
+        # Keep the car loop one ring inward so edge props remain decorative.
+        return 2, BOARD_WIDTH - 3, 2, BOARD_HEIGHT - 4
+
+    def _is_edge_lane_center(self, center_x, center_y):
+        left, right, top, bottom = self._edge_loop_bounds()
+        return center_x in (left, right) or center_y in (top, bottom)
+
+    def _edge_loop_corner_points(self):
+        left, right, top, bottom = self._edge_loop_bounds()
+        return {
+            (left, top),
+            (right, top),
+            (left, bottom),
+            (right, bottom),
+        }
+
+    def _edge_loop_direction_for_position(self, center_x, center_y):
+        left, right, top, bottom = self._edge_loop_bounds()
+
+        if center_y == top and center_x < right:
+            return (1, 0)
+        if center_x == right and center_y < bottom:
+            return (0, 1)
+        if center_y == bottom and center_x > left:
+            return (-1, 0)
+        if center_x == left and center_y > top:
+            return (0, -1)
+
+        return (1, 0)
+
+    def _edge_loop_next_direction(self, center_x, center_y, current_direction):
+        left, right, top, bottom = self._edge_loop_bounds()
+        clockwise_corners = {
+            (left, top): (1, 0),
+            (right, top): (0, 1),
+            (right, bottom): (-1, 0),
+            (left, bottom): (0, -1),
+        }
+
+        if (center_x, center_y) in clockwise_corners:
+            return clockwise_corners[(center_x, center_y)]
+
+        # Keep moving straight between corners.
+        expected = self._edge_loop_direction_for_position(center_x, center_y)
+        if current_direction == expected:
+            return current_direction
+        return expected
+
+    def _bank_positions(self):
+        return [
+            (0, 0),
+            (BOARD_WIDTH - 1, 0),
+            (0, BOARD_HEIGHT - 3),
+            (BOARD_WIDTH - 1, BOARD_HEIGHT - 3),
+            (0, (BOARD_HEIGHT // 2) - 1),
+            (BOARD_WIDTH - 1, (BOARD_HEIGHT // 2) - 1),
+        ]
+
+    def _bank_wall_cells(self, ox, oy):
+        return [
+            (ox, oy + dy)
+            for dy in range(3)
+            if 0 <= ox < BOARD_WIDTH and 0 <= (oy + dy) < BOARD_HEIGHT
+        ]
+
+    def _bank_anchor_point(self, ox, oy):
+        return ox, min(BOARD_HEIGHT - 1, oy + 1)
+
+    def _build_cop_spawn_points(self):
+        # Build small random police spawn markers on literal edges near each bank.
+        points = set()
+        candidates = self._cop_edge_candidates()
+
+        for bx, by in self._bank_positions():
+            ax, ay = self._bank_anchor_point(bx, by)
+            local_candidates = [(ex, ey) for ex, ey in candidates if abs(ex - ax) + abs(ey - ay) <= 4]
+            random.shuffle(local_candidates)
+            for point in local_candidates[:2]:
+                points.add(point)
+
+        # Fallback if random filtering was too strict.
+        if len(points) < 6:
+            for point in candidates:
+                points.add(point)
+                if len(points) >= 8:
+                    break
+
+        return list(points)
+
+    def _cop_edge_candidates(self):
+        points = set()
+        edge_cells = {
+            (x, 0) for x in range(BOARD_WIDTH)
+        } | {
+            (x, BOARD_HEIGHT - 1) for x in range(BOARD_WIDTH)
+        } | {
+            (0, y) for y in range(BOARD_HEIGHT)
+        } | {
+            (BOARD_WIDTH - 1, y) for y in range(BOARD_HEIGHT)
+        }
+
+        for bx, by in self._bank_positions():
+            ax, ay = self._bank_anchor_point(bx, by)
+            bank_cells = set(self._bank_wall_cells(bx, by))
+            for ex, ey in edge_cells:
+                if (ex, ey) in bank_cells:
+                    continue
+                if abs(ex - ax) + abs(ey - ay) <= 4:
+                    points.add((ex, ey))
+
+        if not points:
+            points.update({(0, 6), (0, 24), (BOARD_WIDTH - 1, 6), (BOARD_WIDTH - 1, 24)})
+
+        return list(points)
+
+    def _move_one_cop_spawn(self):
+        if not self.cop_spawn_points:
+            return
+
+        candidates = [pt for pt in self._cop_edge_candidates() if pt not in self.cop_spawn_points]
+        if not candidates:
+            return
+
+        move_idx = random.randrange(len(self.cop_spawn_points))
+        self.cop_spawn_points[move_idx] = random.choice(candidates)
+
+    def _edge_prop_cells(self):
+        # Decorative-only visuals on map edges (no gameplay collision/hitbox).
+        cells = set(self.cop_spawn_points)
+        for bx, by in self._bank_positions():
+            cells.update(self._bank_wall_cells(bx, by))
+        return cells
+
+    def _recovery_side_direction(self):
+        mid_x = (BOARD_WIDTH - 1) / 2.0
+        return -1 if self.big_cube['x'] <= mid_x else 1
+
+    def _generate_middle_obstacles(self, count, min_distance=4):
+        obstacles = []
+        attempts = 0
+        max_attempts = count * 80
+
+        while len(obstacles) < count and attempts < max_attempts:
+            x = random.randint(4, 11)
+            y = random.randint(8, 23)
+
+            is_valid = True
+            for ox, oy in obstacles:
+                distance = abs(x - ox) + abs(y - oy)
+                if distance < min_distance:
+                    is_valid = False
+                    break
+
+            if is_valid:
+                obstacles.append((x, y))
+
+            attempts += 1
+
+        return obstacles
+
     def _expand_obstacle_cells(self, obstacle_centers):
         cells = set()
         for x, y in obstacle_centers:
@@ -427,6 +759,9 @@ class PresidentGame:
         return cells
 
     def _is_playable_map(self, obstacle_centers):
+        if any(not self._is_middle_zone(x, y) for x, y in obstacle_centers):
+            return False
+
         obstacle_cells = self._expand_obstacle_cells(obstacle_centers)
         all_cells = {(x, y) for y in range(BOARD_HEIGHT) for x in range(BOARD_WIDTH)}
         free_cells = all_cells - obstacle_cells
@@ -470,7 +805,7 @@ class PresidentGame:
                     if (cell_x, cell_y) in obstacle_cells:
                         can_place = False
                         break
-                if can_place:
+                if can_place and self._is_edge_lane_center(center_x, center_y):
                     big_positions.add((center_x, center_y))
 
         if len(big_positions) < 24:
@@ -503,7 +838,7 @@ class PresidentGame:
         attempts = 0
         while len(playable) < desired_count and attempts < 200:
             attempts += 1
-            generated = generate_spread_obstacles(random.randint(6, 9), min_distance=5)
+            generated = self._generate_middle_obstacles(random.randint(6, 9), min_distance=5)
             signature = tuple(sorted(generated))
             if signature in seen_signatures:
                 continue
@@ -513,7 +848,7 @@ class PresidentGame:
 
         if not playable:
             # Guaranteed fallback map.
-            playable.append(generate_spread_obstacles(5, min_distance=6))
+            playable.append([(6, 12), (9, 12), (7, 16), (8, 20)])
 
         return playable
 
@@ -564,6 +899,8 @@ class PresidentGame:
 
         self.apply_color_scheme()
         self._populate_obstacles()
+        self.cop_spawn_points = self._build_cop_spawn_points()
+        self.last_cop_move_time = time.time()
 
         # Reset visuals and player pieces for the next timed round.
         self.trail = [[0.0 for _ in range(BOARD_WIDTH)] for _ in range(BOARD_HEIGHT)]
@@ -572,20 +909,24 @@ class PresidentGame:
             p.piece = None
             p.respawn_time = 0
 
-        # Spawn big car in safe spot.
-        bx, by = self._find_safe_spawn()
+        # Spawn big car on edge lane.
+        bx, by = self._find_safe_edge_spawn()
         self.big_cube = {'x': bx, 'y': by, 'color': WHITE}
         self.big_cube_last_progress = time.time()
-        self.big_cube_direction = random.choice([(0, 1), (0, -1), (1, 0), (-1, 0)])
+        self.big_cube_direction = self._edge_loop_direction_for_position(bx, by)
         self.big_cube_last_move = time.time()
         self.big_cube_last_turn = time.time()
-        self.big_cube_turn_interval = random.uniform(0.5, 2)
+        self.big_cube_recovering = False
+        self.big_cube_recover_forward = self.big_cube_direction
+        self.big_cube_recover_side_dx = self._recovery_side_direction()
 
         self.round_start_time = time.time()
         self.state = 'PREFIGHT_FLICKER'
         self.prefight_flicker_start = time.time()
         self.countdown_start_time = 0
+        self.last_countdown_value = -1
         self.flashing_lines = []
+        self.sound.play_ambient()
 
     def setup_players(self, count):
         self.players = []
@@ -630,6 +971,7 @@ class PresidentGame:
                 continue
 
             p.spawn_piece()
+            self.sound.play_spawn()
             if self.big_cube:
                 dx = self.big_cube['x'] - p.piece.x
                 dy = self.big_cube['y'] - p.piece.y
@@ -694,22 +1036,34 @@ class PresidentGame:
             (center_x + 1, center_y + 1),
         ]
 
-    def _can_place_big_cube(self, center_x, center_y):
+    def _can_place_big_cube(self, center_x, center_y, enforce_edge_lane=True):
+        if enforce_edge_lane and not self._is_edge_lane_center(center_x, center_y):
+            return False
+
         obstacle_cells = self._obstacle_cells()
+        edge_props = self._edge_prop_cells()
         for cell_x, cell_y in self._big_cube_cells(center_x, center_y):
             if cell_x < 0 or cell_x >= BOARD_WIDTH or cell_y < 0 or cell_y >= BOARD_HEIGHT:
                 return False
+            if (cell_x, cell_y) in edge_props:
+                # Cops/banks are decorative only, never blocking.
+                continue
             if (cell_x, cell_y) in obstacle_cells:
                 return False
         return True
 
     def is_collision(self, piece, player=None, dx=0, dy=0, absolute_blocks=None):
         blocks = absolute_blocks if absolute_blocks else piece.get_absolute_blocks()
+        edge_props = self._edge_prop_cells()
         for bx, by in blocks:
             nx, ny = bx + dx, by + dy
             # Wall collision
             if nx < 0 or nx >= BOARD_WIDTH or ny >= BOARD_HEIGHT or ny < 0:
                 return True
+
+            # Decorative edge props (banks/cops) should never collide.
+            if (nx, ny) in edge_props:
+                continue
 
             # Locked Board collision
             if self.board[ny][nx] != BLACK:
@@ -753,11 +1107,17 @@ class PresidentGame:
                 if elapsed >= flicker_total:
                     self.state = 'COUNTDOWN'
                     self.countdown_start_time = time.time()
+                    self.last_countdown_value = self.countdown_seconds
+                    self.sound.play_countdown_tick()
                 return
 
             if self.state == 'COUNTDOWN':
                 now = time.time()
                 elapsed = int(now - self.countdown_start_time)
+                remaining = self.countdown_seconds - elapsed
+                if remaining != self.last_countdown_value and remaining > 0:
+                    self.last_countdown_value = remaining
+                    self.sound.play_countdown_tick()
                 if elapsed >= self.countdown_seconds:
                     print("FIGHT! Transition effect...")
                     self.state = 'TRANSITION'
@@ -788,6 +1148,11 @@ class PresidentGame:
                 return
 
             # --- PLAYING STATE ---
+            now = time.time()
+            if now - self.last_cop_move_time >= self.cop_move_interval:
+                self._move_one_cop_spawn()
+                self.last_cop_move_time = now
+
             # Round timer logic must be here!
             if self.round_start_time is not None and self.round_duration_minutes > 0:
                 elapsed = time.time() - self.round_start_time
@@ -808,6 +1173,7 @@ class PresidentGame:
                 if PresidentialVehicle.global_points > 0 and p.respawn_time > 0 and now_respawn >= p.respawn_time:
                     p.respawn_time = 0
                     p.spawn_piece()
+                    self.sound.play_spawn()
                     if self.big_cube:
                         dx = self.big_cube['x'] - p.piece.x
                         dy = self.big_cube['y'] - p.piece.y
@@ -826,23 +1192,50 @@ class PresidentGame:
             now = time.time()
             if now - self.big_cube_last_move >= self.big_cube_speed:
                 moved = False
-                dx, dy = self.big_cube_direction
-                nx = self.big_cube['x'] + dx
-                ny = self.big_cube['y'] + dy
-                if not self._can_place_big_cube(nx, ny):
-                    # Pick a new random direction (not current)
-                    possible_dirs = [(0,1), (0,-1), (1,0), (-1,0)]
-                    if self.big_cube_direction in possible_dirs:
-                        possible_dirs.remove(self.big_cube_direction)
-                    random.shuffle(possible_dirs)
-                    for next_dx, next_dy in possible_dirs:
-                        if self._can_place_big_cube(self.big_cube['x'] + next_dx, self.big_cube['y'] + next_dy):
-                            self.big_cube_direction = (next_dx, next_dy)
-                            break
+                if self.big_cube_recovering:
+                    fdx, fdy = self.big_cube_recover_forward
+                    self.big_cube_direction = (fdx, fdy)
+                    fx = self.big_cube['x'] + fdx
+                    fy = self.big_cube['y'] + fdy
+
+                    if self._can_place_big_cube(fx, fy):
+                        # Forward opened again: return to normal perimeter loop.
+                        self.big_cube['x'] = fx
+                        self.big_cube['y'] = fy
+                        moved = True
+                        self.big_cube_recovering = False
+                    else:
+                        lx = self.big_cube['x'] + self.big_cube_recover_side_dx
+                        ly = self.big_cube['y']
+                        if self._can_place_big_cube(lx, ly, enforce_edge_lane=False):
+                            self.big_cube['x'] = lx
+                            self.big_cube['y'] = ly
+                            moved = True
                 else:
-                    self.big_cube['x'] = nx
-                    self.big_cube['y'] = ny
-                    moved = True
+                    dx, dy = self._edge_loop_next_direction(
+                        self.big_cube['x'],
+                        self.big_cube['y'],
+                        self.big_cube_direction,
+                    )
+                    self.big_cube_direction = (dx, dy)
+                    nx = self.big_cube['x'] + dx
+                    ny = self.big_cube['y'] + dy
+                    if self._can_place_big_cube(nx, ny):
+                        self.big_cube['x'] = nx
+                        self.big_cube['y'] = ny
+                        moved = True
+                    else:
+                        # Enter recovery mode: strafe by map side until forward opens again.
+                        self.big_cube_recovering = True
+                        self.big_cube_recover_forward = (dx, dy)
+                        self.big_cube_recover_side_dx = self._recovery_side_direction()
+                        lx = self.big_cube['x'] + self.big_cube_recover_side_dx
+                        ly = self.big_cube['y']
+                        if self._can_place_big_cube(lx, ly, enforce_edge_lane=False):
+                            self.big_cube['x'] = lx
+                            self.big_cube['y'] = ly
+                            moved = True
+                            self.big_cube_direction = (dx, dy)
 
                 if moved:
                     self.big_cube_last_progress = now
@@ -851,23 +1244,21 @@ class PresidentGame:
                     old_pos = (self.big_cube['x'], self.big_cube['y'])
                     new_pos = old_pos
                     for _ in range(10):
-                        candidate = self._find_safe_spawn()
+                        candidate = self._find_safe_edge_spawn()
                         if candidate != old_pos:
                             new_pos = candidate
                             break
                     self.big_cube['x'], self.big_cube['y'] = new_pos
-                    self.big_cube_direction = random.choice([(0,1),(0,-1),(1,0),(-1,0)])
+                    self.big_cube_direction = self._edge_loop_direction_for_position(
+                        self.big_cube['x'], self.big_cube['y']
+                    )
+                    self.big_cube_recovering = False
+                    self.big_cube_recover_forward = self.big_cube_direction
+                    self.big_cube_recover_side_dx = self._recovery_side_direction()
                     self.big_cube_last_progress = now
                     self.big_cube_last_turn = now
 
                 self.big_cube_last_move = now
-            if now - self.big_cube_last_turn >= self.big_cube_turn_interval:
-                directions = [(0,1),(0,-1),(1,0),(-1,0)]
-                if self.big_cube_direction in directions:
-                    directions.remove(self.big_cube_direction)
-                self.big_cube_direction = random.choice(directions)
-                self.big_cube_turn_interval = random.uniform(2,5)
-                self.big_cube_last_turn = now
 
             if self.flashing_lines:
                 if time.time() - self.flash_start_time > self.flash_duration:
@@ -1022,6 +1413,19 @@ class PresidentGame:
             rx = height - 1 - y
             ry = x
             self.set_led(buffer, ox + rx, oy + ry, color)
+
+    def _draw_bank_sprite(self, buffer, ox, oy, pulse=1.0):
+        pulse = max(0.0, min(1.0, pulse))
+
+        # Minimal bank marker: 1-block-thick beige wall segment on the edge.
+        wall = (
+            int(168 + 30 * pulse),
+            int(150 + 24 * pulse),
+            int(102 + 16 * pulse),
+        )
+
+        for wx, wy in self._bank_wall_cells(ox, oy):
+            self.set_led(buffer, wx, wy, wall)
 
     def render(self):
         buffer = bytearray(FRAME_DATA_LENGTH)
@@ -1317,6 +1721,22 @@ class PresidentGame:
                         if 0 <= nx < BOARD_WIDTH and 0 <= ny < BOARD_HEIGHT:
                             self.set_led(buffer, nx, ny, oc)
 
+                # Cops-and-robbers story props: banks near the edges (inside the perimeter lane).
+                bank_positions = self._bank_positions()
+                for i, (bx, by) in enumerate(bank_positions):
+                    bank_pulse = 0.6 + 0.4 * (0.5 + 0.5 * math.sin(t * 2.1 + i * 0.9))
+                    self._draw_bank_sprite(buffer, bx, by, pulse=bank_pulse)
+
+                # Police spawn markers: blue edge dots around the banks.
+                for i, (sx, sy) in enumerate(self.cop_spawn_points):
+                    pulse = 0.55 + 0.45 * (0.5 + 0.5 * math.sin(t * 3.3 + i * 0.7))
+                    cop_blue = (
+                        int(20 + 30 * pulse),
+                        int(70 + 90 * pulse),
+                        int(170 + 80 * pulse),
+                    )
+                    self.set_led(buffer, sx, sy, cop_blue)
+
                 # Draw trail behind pieces.
                 for y in range(BOARD_HEIGHT):
                     for x in range(BOARD_WIDTH):
@@ -1481,8 +1901,34 @@ class PresidentGame:
         buffer[offset + NUM_CHANNELS] = min(255, buffer[offset + NUM_CHANNELS] + add_r)
         buffer[offset + NUM_CHANNELS * 2] = min(255, buffer[offset + NUM_CHANNELS * 2] + add_b)
 
-    def _find_safe_spawn(self, include_dynamic=False):
+    def _find_safe_spawn(self, include_dynamic=False, prefer_cop_edges=False):
         # Find a random (x, y) not in terrain
+        if prefer_cop_edges and self.cop_spawn_points:
+            shuffled_spawns = list(self.cop_spawn_points)
+            random.shuffle(shuffled_spawns)
+            for x, y in shuffled_spawns:
+                is_safe = True
+                for ox, oy in self.current_obstacle_map:
+                    for dx, dy in [(0,0), (0,-1), (0,1), (-1,0), (1,0)]:
+                        if x == ox + dx and y == oy + dy:
+                            is_safe = False
+                            break
+                    if not is_safe:
+                        break
+
+                if is_safe and include_dynamic:
+                    if self.big_cube and (x, y) in set(self._big_cube_cells()):
+                        is_safe = False
+
+                    if is_safe:
+                        for player in self.players:
+                            if player.piece and player.piece.active and (x, y) in set(player.piece.get_absolute_blocks()):
+                                is_safe = False
+                                break
+
+                if is_safe:
+                    return x, y
+
         attempts = 0
         while attempts < 100:
             x = random.randint(0, BOARD_WIDTH-1)
@@ -1510,6 +1956,49 @@ class PresidentGame:
             attempts += 1
         # fallback: just return (0,0)
         return 0, 0
+
+    def _find_safe_edge_spawn(self):
+        corners = list(self._edge_loop_corner_points())
+        random.shuffle(corners)
+        for x, y in corners:
+            if self._can_place_big_cube(x, y):
+                return x, y
+
+        left, right, top, bottom = self._edge_loop_bounds()
+
+        attempts = 0
+        while attempts < 150:
+            x = random.randint(left, right)
+            y = random.randint(top, bottom)
+
+            if not self._is_edge_lane_center(x, y):
+                attempts += 1
+                continue
+
+            if not self._can_place_big_cube(x, y):
+                attempts += 1
+                continue
+
+            blocked_by_player = False
+            big_cells = set(self._big_cube_cells(x, y))
+            for player in self.players:
+                if not (player.piece and player.piece.active):
+                    continue
+                if any(cell in big_cells for cell in player.piece.get_absolute_blocks()):
+                    blocked_by_player = True
+                    break
+
+            if not blocked_by_player:
+                return x, y
+
+            attempts += 1
+
+        for y in range(top, bottom + 1):
+            for x in range(left, right + 1):
+                if self._is_edge_lane_center(x, y) and self._can_place_big_cube(x, y):
+                    return x, y
+
+        return 1, 0
 
 
 class NetworkManager:
