@@ -8,6 +8,7 @@ import psutil
 import os
 import sys
 import subprocess
+import importlib
 import math
 import wave
 from pathlib import Path
@@ -34,7 +35,6 @@ try:
 except ImportError:
     PYGAME_AVAILABLE = False
 
-<<<<<<< HEAD
 def _ensure_mido_installed():
     """Fast one-time check/install for mido on startup."""
     if importlib.util.find_spec("mido") is not None:
@@ -67,13 +67,11 @@ def _ensure_mido_installed():
     return False
 
 MIDO_AVAILABLE = _ensure_mido_installed()
-=======
 try:
     import winsound
     WINSOUND_AVAILABLE = True
 except ImportError:
     WINSOUND_AVAILABLE = False
->>>>>>> ciprian
 
 # --- Sample-based Piano (uses real piano samples) ---
 SEMITONE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]

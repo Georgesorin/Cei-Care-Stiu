@@ -55,7 +55,7 @@ INPUT_CHANNEL = 7
 
 # --- Background Music ---
 BGM_FILENAME = "Lady Gaga - Judas (Lyrics) - bemu (128k).wav"
-BGM_VOLUME   = 0.5   # 0.0 = silent, 1.0 = full volume
+BGM_VOLUME   = 0.7   # 0.0 = silent, 1.0 = full volume
 
 # --- Colors (R, G, B) ---
 BLACK   = (0,   0,   0)
@@ -114,7 +114,8 @@ FONT = {
 }
 
 # --- Battle Blaster Game Constants ---
-GAME_DURATION           = 300     # 5 minutes in seconds
+GAME_DURATION           = 120     # 2 minutes in seconds
+FIRE_COOLDOWN           = 0.7     # seconds lockout per column after firing
 PROJECTILE_TICK_INTERVAL = 0.075  # seconds between projectile steps (doubled speed)
 POWERUP_SPAWN_INTERVAL  = 4.0     # seconds between spawns
 POWERUP_LIFETIME        = 30.0    # seconds power-up stays on board
@@ -486,6 +487,7 @@ class BattleGame:
         # Timers
         self.last_proj_tick     = {'A': 0.0, 'B': 0.0}
         self.last_powerup_spawn = 0.0
+        self.last_fire_time     = {}
         self.startup_step       = 0
         self.startup_timer      = time.time()
         self.game_over_timer    = 0.0
@@ -510,6 +512,7 @@ class BattleGame:
             now = time.time()
             self.last_proj_tick     = {'A': now, 'B': now}
             self.last_powerup_spawn = now
+            self.last_fire_time     = {}
             self.game_start_time    = 0.0   # set when PLAYING actually begins
             self.last_console_print = 0.0
             self.sound.start_bgm()
@@ -620,14 +623,17 @@ class BattleGame:
     # -----------------------------------------------------------------------
 
     def process_inputs(self):
+        now = time.time()
         for team_id in ('A', 'B'):
             team = self.teams[team_id]
             for col in range(BOARD_WIDTH):
                 led_idx     = team.led_idx_for_col(col)
                 is_pressed  = self.button_states[led_idx]
                 was_pressed = self.prev_button_states[led_idx]
-                if is_pressed and not was_pressed:          # fresh press → fire immediately
-                    self.fire_projectile(team_id, col)
+                if is_pressed and not was_pressed:
+                    if now - self.last_fire_time.get(team_id, 0) >= FIRE_COOLDOWN:
+                        self.fire_projectile(team_id, col)
+                        self.last_fire_time[team_id] = now
 
         for i in range(BUTTON_STATES_SIZE):
             self.prev_button_states[i] = self.button_states[i]
@@ -679,22 +685,36 @@ class BattleGame:
                 if not proj.active or proj.team_id != team_id:
                     continue
 
-                # Cross-collision: check if the destination cell holds an opposing projectile
+                # Cross-collision check
                 next_y = proj.y + team.direction
-                for opp in self.projectiles:
-                    if opp.active and opp.team_id != team_id and opp.x == proj.x and opp.y == next_y \
-                            and not proj.unblockable and not opp.unblockable:
-                        proj.active = False
-                        opp.active = False
-                        # Big explosion at the midpoint between the two projectiles
-                        mid_y = (proj.y + opp.y) // 2
-                        self.explosions.append({
-                            'x': proj.x - 1, 'y': mid_y - 1,
-                            'color': VIOLET,
-                            'start': time.time(),
-                            'big': True,
-                        })
-                        self.sound.play('hit')
+                if proj.unblockable:
+                    # Ultimate wipes every enemy on the entire destination row
+                    for opp in self.projectiles:
+                        if opp.active and opp.team_id != team_id and opp.y == next_y:
+                            opp.active = False
+                            self.sound.play('hit')
+                else:
+                    # Normal projectile: only check same column
+                    for opp in self.projectiles:
+                        if not opp.active or opp.team_id == team_id \
+                                or opp.x != proj.x or opp.y != next_y:
+                            continue
+                        if opp.unblockable:
+                            # Enemy ultimate destroys us, keeps going
+                            proj.active = False
+                            self.sound.play('hit')
+                        else:
+                            # Mutual destruction
+                            proj.active = False
+                            opp.active = False
+                            mid_y = (proj.y + opp.y) // 2
+                            self.explosions.append({
+                                'x': proj.x - 1, 'y': mid_y - 1,
+                                'color': VIOLET,
+                                'start': time.time(),
+                                'big': True,
+                            })
+                            self.sound.play('hit')
                         break
                 if not proj.active:
                     continue
@@ -755,10 +775,20 @@ class BattleGame:
     # -----------------------------------------------------------------------
 
     def handle_collisions(self):
+        # Ultimate projectiles destroy every enemy on the same row
+        for proj in self.projectiles:
+            if not proj.active or not proj.unblockable:
+                continue
+            for opp in self.projectiles:
+                if opp.active and opp.team_id != proj.team_id \
+                        and opp.y == proj.y and not opp.unblockable:
+                    opp.active = False
+
+        # Normal same-cell collisions (column-matched)
         pos_a = {}
         pos_b = {}
         for proj in self.projectiles:
-            if not proj.active:
+            if not proj.active or proj.unblockable:
                 continue
             key = (proj.x, proj.y)
             if proj.team_id == 'A':
@@ -768,8 +798,6 @@ class BattleGame:
 
         for key in pos_a:
             if key in pos_b:
-                if pos_a[key].unblockable or pos_b[key].unblockable:
-                    continue  # unblockable passes through
                 pos_a[key].active = False
                 pos_b[key].active = False
 
@@ -804,8 +832,13 @@ class BattleGame:
             y = random.randint(POWERUP_SPAWN_ROW_MIN, POWERUP_SPAWN_ROW_MAX - 1)  # leave room for y+1
             if (x, y) not in occupied and (x+1, y) not in occupied and \
                (x, y+1) not in occupied and (x+1, y+1) not in occupied:
-                ptype = random.choice([PTYPE_SPEED, PTYPE_DOUBLE,
-                                       PTYPE_ULTIMATE, PTYPE_ULTIMATE])  # weighted slightly
+                ultimate_locked = (
+                    any(pu.active and pu.ptype == PTYPE_ULTIMATE for pu in self.power_ups) or
+                    any(p.active  and p.unblockable               for p  in self.projectiles)
+                )
+                choices = [PTYPE_SPEED, PTYPE_DOUBLE] if ultimate_locked else \
+                          [PTYPE_SPEED, PTYPE_DOUBLE, PTYPE_ULTIMATE, PTYPE_ULTIMATE]
+                ptype = random.choice(choices)
                 self.power_ups.append(PowerUp(x, y, ptype))
                 names = {PTYPE_SPEED: 'SPEED',
                          PTYPE_DOUBLE: 'DOUBLE', PTYPE_ULTIMATE: 'ULTIMATE'}
