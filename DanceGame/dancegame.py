@@ -371,7 +371,7 @@ class Player:
         if state_key in self.last_scored_states:
             del self.last_scored_states[state_key]
 
-class TestGame:
+class DanceGame:
     def __init__(self):
         self.board = [[BLACK for _ in range(BOARD_WIDTH)] for _ in range(BOARD_HEIGHT)]
 
@@ -1022,7 +1022,7 @@ def game_thread_func(game):
         time.sleep(0.01)
 
 if __name__ == "__main__":
-    game = TestGame()
+    game = DanceGame()
     net = NetworkManager(game)
     net.start_bg()
 
