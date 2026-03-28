@@ -15,6 +15,9 @@ try:
 except ImportError:
     PYGAME_AVAILABLE = False
 
+# --- Game Winner ---
+WINNER_P = None  # Will be set when game ends
+
 # --- Configuration ---
 _CFG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tetris_config.json")
 
@@ -107,14 +110,46 @@ class Player:
     def __init__(self):
         self.points = 0
         self.player_scores = {}
+        self.player_combos = {}
+        self.player_max_combos = {}
+        self.player_misses = {}
         self.control_rows = [1, 2, 3, 4, 5]  # Control pad rows for groups 0-4
         self.control_column = 1  # Control pads are at column 1
         self.last_scored_states = {}  # Track which flashes we've already scored
 
-    def add_point(self, player_id):
-        """Increment total score and per-player score."""
-        self.points += 1
-        self.player_scores[player_id] = self.player_scores.get(player_id, 0) + 1
+    def get_multiplier(self, combo):
+        """Beat Saber-style combo multiplier curve: 1x, 2x, 4x, 8x."""
+        if combo >= 14:
+            return 8
+        if combo >= 6:
+            return 4
+        if combo >= 2:
+            return 2
+        return 1
+
+    def register_hit(self, player_id, base_points=1):
+        """Register a successful hit, update combo and score with multiplier."""
+        combo = self.player_combos.get(player_id, 0) + 1
+        self.player_combos[player_id] = combo
+
+        max_combo = self.player_max_combos.get(player_id, 0)
+        if combo > max_combo:
+            self.player_max_combos[player_id] = combo
+
+        multiplier = self.get_multiplier(combo)
+        gained = base_points * multiplier
+
+        self.points += gained
+        self.player_scores[player_id] = self.player_scores.get(player_id, 0) + gained
+
+        return gained, multiplier, combo
+
+    def register_miss(self, player_id):
+        """Register a miss and break combo."""
+        previous_combo = self.player_combos.get(player_id, 0)
+        self.player_combos[player_id] = 0
+        self.player_misses[player_id] = self.player_misses.get(player_id, 0) + 1
+        return previous_combo
 
     def get_led_index(self, x, y):
         """Convert (x, y) board position to LED index for button checking"""
@@ -170,6 +205,7 @@ class TestGame:
         self.state = 'LOBBY' # LOBBY, STARTUP, PLAYING, GAMEOVER
         self.startup_step = 0
         self.startup_timer = time.time()
+        self.lobby_timer = time.time()  # Timer for LOBBY zone display
 
         self.lock = threading.RLock()
         
@@ -211,7 +247,19 @@ class TestGame:
 
         self.player_button_map = player_map
 
-    def reset_board(self):
+    def button_index_to_xy(self, button_index):
+        """Convert button index (0..511) back to (x, y) board coordinates."""
+        channel = button_index // 64
+        led_index = button_index % 64
+        row_in_channel = led_index // 16
+        y = channel * 4 + row_in_channel
+        
+        if row_in_channel % 2 == 0:
+            x = led_index % 16
+        else:
+            x = 15 - (led_index % 16)
+        
+        return x, y
         self.board = [[BLACK for _ in range(BOARD_WIDTH)] for _ in range(BOARD_HEIGHT)]
 
     def set_led(self, buffer, x, y, color):
@@ -261,6 +309,58 @@ class TestGame:
                 faded_color = (r_fade, g_fade, b_fade)
                 self.set_led(frame_buffer, x, y, faded_color)
                 self.board[y][x] = faded_color  # Update board with faded color
+
+        # ===========================================
+        # LOBBY STATE: Flash player zones
+        # ===========================================
+        if self.state == 'LOBBY':
+            # Create a flashing pattern (on/off every 0.5 seconds)
+            flash_cycle = int((time.time() - self.lobby_timer) * 2) % 2
+            
+            # Ensure player_button_map is built (copy from render logic)
+            LEFT_EDGE = 1
+            RIGHT_EDGE = BOARD_WIDTH - 2
+            ROW_GROUPS_LEFT = [
+                (1, 7, 13, 19, 25),   # Group 0
+                (2, 8, 14, 20, 26),   # Group 1
+                (3, 9, 15, 21, 27),   # Group 2
+                (4, 10, 16, 22, 28),  # Group 3
+                (5, 11, 17, 23, 29)   # Group 4
+            ]
+            ROW_GROUPS_RIGHT = [
+                (1, 7, 13, 19, 25),
+                (2, 8, 14, 20, 26),
+                (3, 9, 15, 21, 27),
+                (4, 10, 16, 22, 28),
+                (5, 11, 17, 23, 29)
+            ]
+            
+            if not self.player_button_map:
+                self._build_player_button_map(ROW_GROUPS_LEFT, ROW_GROUPS_RIGHT, LEFT_EDGE, RIGHT_EDGE)
+            
+            # Player colors (10 players)
+            PLAYER_COLORS = [
+                RED, BLUE, GREEN, CYAN, MAGENTA,
+                YELLOW, ORANGE, WHITE, RED, BLUE
+            ]
+            
+            # Flash each player's zones when flash_cycle is 1
+            if flash_cycle == 1:
+                for player_id in range(1, 11):
+                    if player_id in self.player_button_map:
+                        player_buttons = self.player_button_map[player_id]
+                        color = PLAYER_COLORS[player_id - 1]
+                        
+                        for button_idx in player_buttons:
+                            x, y = self.button_index_to_xy(button_idx)
+                            if 0 <= x < BOARD_WIDTH and 0 <= y < BOARD_HEIGHT:
+                                self.set_led(frame_buffer, x, y, color)
+                                self.board[y][x] = color
+            
+            # Step 3: Update animation timing
+            self.time_counter += 1
+            self.prev_button_states = self.button_states.copy()
+            return frame_buffer
 
         # ===========================================
         # MATRIX BORDER AND CENTER COLUMN
@@ -348,6 +448,7 @@ class TestGame:
             self.group_flash_timers = {}   # Flash duration timers
             self.group_speed_counters = {} # Speed control counters
             self.group_directions = {}     # Direction: -1 for left, +1 for right
+            self.group_hit_players = {}    # Track which players hit during current flash window
 
             self.global_spawn_timer = 0
 
@@ -413,6 +514,7 @@ class TestGame:
                     else:
                         self.group_states[group_index] = 'flashing'
                         self.group_flash_timers[group_index] = 0
+                        self.group_hit_players[group_index] = set()
                 else:  # Moving right
                     if self.group_positions[group_index] < RIGHT_EDGE:
                         self.group_speed_counters[group_index] += 1
@@ -422,6 +524,7 @@ class TestGame:
                     else:
                         self.group_states[group_index] = 'flashing'
                         self.group_flash_timers[group_index] = 0
+                        self.group_hit_players[group_index] = set()
 
             elif state == 'flashing':
                 self.group_flash_timers[group_index] += 1
@@ -443,14 +546,30 @@ class TestGame:
                     was_pressed = lane_button < len(self.prev_button_states) and self.prev_button_states[lane_button]
 
                     # Score only on a tap edge while the note is in the hit window.
-                    if is_pressed and not was_pressed:
-                        self.player.add_point(player_id)
+                    if is_pressed and not was_pressed and player_id not in self.group_hit_players.get(group_index, set()):
+                        gained, multiplier, combo = self.player.register_hit(player_id)
+                        self.group_hit_players.setdefault(group_index, set()).add(player_id)
                         print(
                             f"P{player_id} HIT lane {lane_index} | "
+                            f"+{gained} (x{multiplier}) | "
+                            f"Combo: {combo} | "
                             f"P{player_id} Score: {self.player.player_scores[player_id]}"
                         )
 
                 if self.group_flash_timers[group_index] >= 3:
+                    # Any player on this side who did not hit this note gets a miss.
+                    hit_players = self.group_hit_players.get(group_index, set())
+                    for band_index in range(5):
+                        player_id = (band_index * 2) + (1 if is_left_side_group else 2)
+                        if player_id not in hit_players:
+                            broken_combo = self.player.register_miss(player_id)
+                            if broken_combo > 0:
+                                print(
+                                    f"P{player_id} MISS lane {lane_index} | "
+                                    f"Combo Broken: {broken_combo}"
+                                )
+
+                    self.group_hit_players[group_index] = set()
                     self.group_states[group_index] = 'waiting'
 
             # ===========================================
@@ -478,6 +597,13 @@ class TestGame:
     def tick(self):
         with self.lock:
             if self.state == 'LOBBY':
+                # Display player zones for 7 seconds, then transition to STARTUP
+                now = time.time()
+                if now - self.lobby_timer >= 7:
+                    print("Entering STARTUP phase...")
+                    self.state = 'STARTUP'
+                    self.startup_timer = now
+                    self.startup_step = 0
                 return
 
             if self.state == 'STARTUP':
@@ -491,6 +617,30 @@ class TestGame:
                         self.state = 'PLAYING'
                         self.game_start_time = time.time()
                         self.spawn_all()
+                return
+
+            if self.state == 'PLAYING':
+                # Check if 3 minutes (180 seconds) have elapsed
+                now = time.time()
+                elapsed_time = now - self.game_start_time
+                
+                if elapsed_time >= 180:
+                    # Game over - calculate winner
+                    global WINNER_P
+                    if self.player.player_scores:
+                        WINNER_P = max(self.player.player_scores, key=self.player.player_scores.get)
+                        winner_score = self.player.player_scores[WINNER_P]
+                        print(f"\n=== TIME'S UP ===")
+                        print(f"Winner: P{WINNER_P} with {winner_score} points!")
+                        print(f"Final Scores: {self.player.player_scores}\n")
+                    else:
+                        WINNER_P = None
+                        print("\n=== TIME'S UP ===")
+                        print("No scores recorded.\n")
+                    
+                    self.state = 'GAMEOVER'
+                    self.game_over_timer = now
+                    self.winner_flash_count = 0
                 return
 
             if self.state == 'GAMEOVER':
