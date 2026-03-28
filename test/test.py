@@ -8,7 +8,7 @@ import psutil
 import os
 import sys
 import subprocess
-import importlib
+import importlib.util
 import math
 import wave
 from pathlib import Path
