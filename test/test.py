@@ -15,6 +15,180 @@ try:
 except ImportError:
     PYGAME_AVAILABLE = False
 
+# --- Sound Manager ---
+class SoundManager:
+    """Simple sound manager using pygame mixer or wave files"""
+    def __init__(self):
+        self.available = False
+        self.click_sound = None
+        self.bgm_sound = None
+        self.bgm_playing = False
+        
+        if PYGAME_AVAILABLE:
+            try:
+                pygame.mixer.init()
+                self.available = True
+                self._generate_click_sound()
+                self._generate_bgm_sound()
+                print("Sound manager initialized with pygame")
+            except Exception as e:
+                print(f"Warning: Could not initialize pygame mixer: {e}")
+    
+    def _generate_click_sound(self):
+        """Generate a simple click sound as a WAV file and load it"""
+        import wave
+        import math
+        
+        sfx_dir = "_sfx"
+        click_path = os.path.join(sfx_dir, "click.wav")
+        
+        try:
+            # Create _sfx directory if it doesn't exist
+            if not os.path.exists(sfx_dir):
+                os.makedirs(sfx_dir)
+            
+            # Generate click sound if it doesn't exist
+            if not os.path.exists(click_path):
+                sample_rate = 44100
+                duration = 0.1  # 100ms click
+                frequency = 800  # Hz
+                
+                n_samples = int(sample_rate * duration)
+                
+                # Generate sample data
+                audio_data = bytearray()
+                for i in range(n_samples):
+                    t = i / sample_rate
+                    # Simple sine wave
+                    val = math.sin(2 * math.pi * frequency * t)
+                    
+                    # Fade out
+                    fade = max(0, 1 - (i / n_samples) * 2)
+                    val *= fade * 0.5
+                    
+                    # Convert to 8-bit value
+                    sample = int((val + 1.0) * 127.5)
+                    sample = max(0, min(255, sample))
+                    audio_data.append(sample)
+                
+                # Write WAV file
+                with wave.open(click_path, 'w') as wav_file:
+                    wav_file.setnchannels(1)  # Mono
+                    wav_file.setsampwidth(1)  # 8-bit
+                    wav_file.setframerate(sample_rate)
+                    wav_file.writeframes(audio_data)
+                
+                print(f"Generated click sound at {click_path}")
+            
+            # Load the sound
+            self.click_sound = pygame.mixer.Sound(click_path)
+            print(f"Loaded click sound from {click_path}")
+            
+        except Exception as e:
+            print(f"Warning: Could not generate/load click sound: {e}")
+    
+    def _generate_tone(self, freq, duration, vol=0.2, sample_rate=44100):
+        """Generate a simple tone"""
+        import math
+        n_samples = int(sample_rate * duration)
+        audio_data = bytearray()
+        
+        for i in range(n_samples):
+            t = i / sample_rate
+            # Square wave for 8-bit chiptune feel
+            val = 1.0 if math.sin(2 * math.pi * freq * t) > 0 else -1.0
+            
+            # Convert to 8-bit value
+            sample = int((val * vol + 1.0) * 127.5)
+            sample = max(0, min(255, sample))
+            audio_data.append(sample)
+        
+        return audio_data
+    
+    def _generate_bgm_sound(self):
+        """Generate 8-bit BGM as a WAV file and load it"""
+        import wave
+        
+        sfx_dir = "_sfx"
+        bgm_path = os.path.join(sfx_dir, "bgm.wav")
+        
+        try:
+            # Create _sfx directory if it doesn't exist
+            if not os.path.exists(sfx_dir):
+                os.makedirs(sfx_dir)
+            
+            # Generate BGM if it doesn't exist
+            if not os.path.exists(bgm_path):
+                sample_rate = 44100
+                bpm = 120
+                beat_dur = 60 / bpm
+                
+                # 8-bit style melody loop: A3, C4, D4, E4 pattern
+                melody_notes = [
+                    (220, 0.25), (0, 0.25), (220, 0.25), (0, 0.25), # A3
+                    (261, 0.25), (0, 0.25), (293, 0.25), (0, 0.25), # C4, D4
+                    (329, 0.5), (293, 0.5), (261, 0.5), (220, 0.5)  # E4, D4, C4, A3
+                ]
+                
+                bgm_data = bytearray()
+                for freq, dur_beats in melody_notes:
+                    dur_sec = dur_beats * beat_dur * 2  # Speed up slightly
+                    if freq == 0:
+                        # Silence
+                        audio = bytearray([128] * int(sample_rate * dur_sec))
+                    else:
+                        # Tone
+                        audio = self._generate_tone(freq, dur_sec, vol=0.1, sample_rate=sample_rate)
+                    bgm_data += audio
+                
+                # Repeat the melody 3 times to make it longer
+                full_bgm = bgm_data * 3
+                
+                # Write WAV file
+                with wave.open(bgm_path, 'w') as wav_file:
+                    wav_file.setnchannels(1)  # Mono
+                    wav_file.setsampwidth(1)  # 8-bit
+                    wav_file.setframerate(sample_rate)
+                    wav_file.writeframes(full_bgm)
+                
+                print(f"Generated BGM at {bgm_path}")
+            
+            # Load the sound
+            self.bgm_sound = pygame.mixer.Sound(bgm_path)
+            self.bgm_sound.set_volume(0.2)  # Set BGM volume to 20% (adjust this number to change volume)
+            print(f"Loaded BGM from {bgm_path}")
+            
+        except Exception as e:
+            print(f"Warning: Could not generate/load BGM: {e}")
+    
+    def play_click(self):
+        """Play the click sound"""
+        if self.available and self.click_sound:
+            try:
+                self.click_sound.play()
+            except Exception as e:
+                print(f"Warning: Could not play click sound: {e}")
+    
+    def play_bgm(self, loops=-1):
+        """Play the BGM (loops=-1 means infinite loop)"""
+        if self.available and self.bgm_sound and not self.bgm_playing:
+            try:
+                self.bgm_sound.play(loops)
+                self.bgm_playing = True
+                print("BGM started")
+            except Exception as e:
+                print(f"Warning: Could not play BGM: {e}")
+    
+    def stop_bgm(self):
+        """Stop the BGM"""
+        if self.available and self.bgm_sound and self.bgm_playing:
+            try:
+                self.bgm_sound.stop()
+                self.bgm_playing = False
+                print("BGM stopped")
+            except Exception as e:
+                print(f"Warning: Could not stop BGM: {e}")
+
 # --- Game Winner ---
 WINNER_P = None  # Will be set when game ends
 
@@ -215,6 +389,9 @@ class TestGame:
         self.prev_button_states = [False] * MATRIX_TOUCH_COUNT  # Edge detection: tap = False -> True
         # 10-player mapping: each player owns a row-band and has 5 lane buttons.
         self.player_button_map = {}
+        
+        # Initialize sound manager
+        self.sound_manager = SoundManager()
 
     def _build_player_button_map(self, row_groups_left, row_groups_right, left_edge, right_edge):
         """Build 10-player button map from row-group bands.
@@ -515,6 +692,7 @@ class TestGame:
                         self.group_states[group_index] = 'flashing'
                         self.group_flash_timers[group_index] = 0
                         self.group_hit_players[group_index] = set()
+                        self.sound_manager.play_click()
                 else:  # Moving right
                     if self.group_positions[group_index] < RIGHT_EDGE:
                         self.group_speed_counters[group_index] += 1
@@ -525,6 +703,7 @@ class TestGame:
                         self.group_states[group_index] = 'flashing'
                         self.group_flash_timers[group_index] = 0
                         self.group_hit_players[group_index] = set()
+                        self.sound_manager.play_click()
 
             elif state == 'flashing':
                 self.group_flash_timers[group_index] += 1
@@ -608,6 +787,10 @@ class TestGame:
 
             if self.state == 'STARTUP':
                 now = time.time()
+                # Start music at the beginning of STARTUP
+                if self.startup_step == 0:
+                    self.sound_manager.play_bgm()
+                
                 delay = 0.2 if self.startup_step < 5 else 1.0
                 if now - self.startup_timer > delay:
                     self.startup_step += 1
@@ -616,7 +799,6 @@ class TestGame:
                         print("FIGHT! Game Starting...")
                         self.state = 'PLAYING'
                         self.game_start_time = time.time()
-                        self.spawn_all()
                 return
 
             if self.state == 'PLAYING':
@@ -626,6 +808,7 @@ class TestGame:
                 
                 if elapsed_time >= 180:
                     # Game over - calculate winner
+                    self.sound_manager.stop_bgm()
                     global WINNER_P
                     if self.player.player_scores:
                         WINNER_P = max(self.player.player_scores, key=self.player.player_scores.get)
