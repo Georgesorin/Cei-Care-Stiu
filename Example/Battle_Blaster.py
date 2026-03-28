@@ -6,6 +6,8 @@ import random
 import copy
 import psutil
 import os
+import math
+import array as _array
 
 import json
 
@@ -187,6 +189,143 @@ class SoundManager:
             print(f"Audio init failed: {e}")
             self.enabled = False
 
+    # ------------------------------------------------------------------ #
+    #  Pure-Python audio synthesis helpers                                #
+    # ------------------------------------------------------------------ #
+    _SR = 44100   # sample rate
+
+    def _build_sound(self, freqs_amps, duration,
+                     env_attack=0.008, env_decay=3.0,
+                     reverb=None, echo=None,
+                     distort=False, master=0.72):
+        """
+        Synthesise a stereo 16-bit pygame.mixer.Sound.
+
+        freqs_amps : list of (hz, amplitude)   – summed sine waves
+        duration   : seconds
+        env_attack : attack time in seconds
+        env_decay  : exponential decay rate  (higher = faster fade)
+        reverb     : list of (delay_sec, gain) pairs
+        echo       : (delay_sec, gain) single echo tap
+        distort    : apply soft-clip distortion (power chord grit)
+        master     : final volume scalar 0..1
+        """
+        SR  = self._SR
+        N   = int(SR * duration)
+        sig = [0.0] * N
+
+        # Mix sine waves
+        for freq, amp in freqs_amps:
+            for i in range(N):
+                t   = i / SR
+                env = (1.0 - math.exp(-t / max(env_attack, 1e-6))) * math.exp(-env_decay * t)
+                sig[i] += amp * env * math.sin(2.0 * math.pi * freq * t)
+
+        # Soft-clip distortion (tanh approximation)
+        if distort:
+            drive = 2.5
+            for i in range(N):
+                x = sig[i] * drive
+                # fast tanh via rational approx
+                if   x >  1.0: sig[i] =  1.0
+                elif x < -1.0: sig[i] = -1.0
+                else:          sig[i] = x * (27.0 + x*x) / (27.0 + 9.0*x*x)
+
+        # Reverb (comb: multiple delay taps)
+        if reverb:
+            wet = [0.0] * N
+            for delay_sec, gain in reverb:
+                d = int(SR * delay_sec)
+                for i in range(d, N):
+                    wet[i] += sig[i - d] * gain
+            for i in range(N):
+                sig[i] += wet[i]
+
+        # Echo (single distinct repeat)
+        if echo:
+            delay_sec, gain = echo
+            d = int(SR * delay_sec)
+            for i in range(d, N):
+                sig[i] += sig[i - d] * gain
+
+        # Normalise → 16-bit stereo interleaved
+        peak = max(abs(s) for s in sig) or 1.0
+        scale = master * 32767.0 / peak
+        buf = _array.array('h', [0] * (N * 2))
+        for i in range(N):
+            v = int(sig[i] * scale)
+            v = max(-32768, min(32767, v))
+            buf[i * 2]     = v
+            buf[i * 2 + 1] = v
+        return pygame.mixer.Sound(buffer=buf)
+
+    def _synth_hit(self):
+        """Low, bassy impact + heavy reverb — projectile vs projectile."""
+        return self._build_sound(
+            freqs_amps=[(90, 0.9), (55, 0.7), (140, 0.4), (180, 0.2)],
+            duration=0.9,
+            env_attack=0.003, env_decay=5.5,
+            reverb=[(0.018, 0.55), (0.035, 0.38), (0.065, 0.22), (0.11, 0.12)],
+            master=0.80,
+        )
+
+    def _synth_powerup(self):
+        """Lower-register chime + warm reverb — collect a regular power-up."""
+        return self._build_sound(
+            freqs_amps=[(130, 0.8), (195, 0.5), (260, 0.3)],
+            duration=0.8,
+            env_attack=0.010, env_decay=4.0,
+            reverb=[(0.022, 0.50), (0.048, 0.28), (0.090, 0.14)],
+            master=0.70,
+        )
+
+    def _synth_score(self):
+        """Deep resonant thud + reverb tail — a point scored."""
+        return self._build_sound(
+            freqs_amps=[(75, 0.9), (112, 0.5), (50, 0.6)],
+            duration=1.0,
+            env_attack=0.005, env_decay=4.5,
+            reverb=[(0.025, 0.55), (0.055, 0.32), (0.100, 0.18)],
+            master=0.78,
+        )
+
+    def _synth_launch(self):
+        """Deep sub-bass cannon thump — projectile fires."""
+        return self._build_sound(
+            freqs_amps=[(42, 0.9), (28, 0.8), (68, 0.5), (95, 0.3)],
+            duration=0.55,
+            env_attack=0.004, env_decay=7.0,
+            reverb=[(0.016, 0.45), (0.034, 0.25), (0.060, 0.12)],
+            master=0.82,
+        )
+
+    def _synth_ultimate_hit(self):
+        """Massive deep explosion + heavy reverb + long echo — sphere/slash impact."""
+        return self._build_sound(
+            freqs_amps=[(38, 0.9), (55, 0.75), (27, 0.8), (80, 0.5), (110, 0.35), (160, 0.25)],
+            duration=2.0,
+            env_attack=0.003, env_decay=1.6,
+            reverb=[(0.020, 0.65), (0.045, 0.48), (0.090, 0.32), (0.160, 0.20), (0.250, 0.12)],
+            echo=(0.280, 0.55),
+            distort=True,
+            master=0.85,
+        )
+
+    def _synth_ultimate(self):
+        """Power chord (E2 + B2 + E3) with distortion, reverb & echo — ultimate fires."""
+        # E2=82 Hz, B2=123 Hz, E3=164 Hz, add sub-octave at 41 Hz
+        return self._build_sound(
+            freqs_amps=[(82, 0.7), (123, 0.65), (164, 0.55), (41, 0.45), (246, 0.30)],
+            duration=1.4,
+            env_attack=0.006, env_decay=1.8,
+            reverb=[(0.018, 0.60), (0.040, 0.42), (0.080, 0.26), (0.130, 0.15)],
+            echo=(0.170, 0.52),
+            distort=True,
+            master=0.75,
+        )
+
+    # ------------------------------------------------------------------ #
+
     def _load_sounds(self):
         if not os.path.exists("_sfx/bgm.wav"):
             try:
@@ -198,9 +337,7 @@ class SoundManager:
 
         sfx_files = {
             'move':     '_sfx/move.wav',
-            'rotate':   '_sfx/rotate.wav',
             'drop':     '_sfx/drop.wav',
-            'line':     '_sfx/line.wav',
             'gameover': '_sfx/gameover.wav',
         }
         for name, path in sfx_files.items():
@@ -210,13 +347,26 @@ class SoundManager:
                 except:
                     print(f"Failed to load {path}")
 
+        # Synthesised sounds — generated fresh at startup
+        try:
+            print("Synthesising SFX...")
+            self.sounds['move']         = self._synth_launch()
+            self.sounds['hit']          = self._synth_hit()
+            self.sounds['powerup']      = self._synth_powerup()
+            self.sounds['score']        = self._synth_score()
+            self.sounds['ultimate_sfx'] = self._synth_ultimate()
+            self.sounds['ultimate_hit'] = self._synth_ultimate_hit()
+            print("SFX synthesis complete.")
+        except Exception as e:
+            print(f"SFX synthesis failed: {e}")
+
         BGM_PATH = r"C:\Users\rnech\Desktop\hackaton\Cei-Care-Stiu\Example\_sfx\Lady Gaga - Judas (Lyrics) - bemu (128k).wav"
         if not os.path.exists(BGM_PATH):
             BGM_PATH = "_sfx/bgm.wav"   # fallback to default
         if os.path.exists(BGM_PATH):
             try:
                 pygame.mixer.music.load(BGM_PATH)
-                pygame.mixer.music.set_volume(0.6)
+                pygame.mixer.music.set_volume(0.4)
                 print(f"BGM loaded OK: {BGM_PATH}")
             except Exception as e:
                 print(f"Failed to load BGM as WAV ({e}), trying as MP3...")
@@ -224,7 +374,7 @@ class SoundManager:
                     mp3_path = BGM_PATH.replace(".wav", ".mp3")
                     # Try loading the .wav path directly via pygame (it handles mp3 too)
                     pygame.mixer.music.load(BGM_PATH)
-                    pygame.mixer.music.set_volume(0.6)
+                    pygame.mixer.music.set_volume(0.4)
                     print("BGM loaded OK as MP3")
                 except Exception as e2:
                     print(f"BGM load failed entirely: {e2}")
@@ -581,7 +731,7 @@ class BattleGame:
                             'start': time.time(),
                             'big': True,
                         })
-                        self.sound.play('tetris')
+                        self.sound.play('hit')
                         break
                 if not proj.active:
                     continue
@@ -602,7 +752,10 @@ class BattleGame:
                             'start': time.time()
                         })
                         pu.active = False
-                        self.sound.play('rotate')
+                        if pu.ptype == PTYPE_ULTIMATE:
+                            self.sound.play('ultimate_sfx')
+                        else:
+                            self.sound.play('powerup')
                         break
 
                 # Did projectile reach the enemy base or exit the board?
@@ -615,8 +768,9 @@ class BattleGame:
                     if proj.points >= 3:
                         self.explosions.append({'x': proj.x, 'y': TEAM_B_BASE_ROW,
                                                 'color': DARK_RED, 'start': time.time(), 'ultimate': True})
+                        self.sound.play('ultimate_hit')
                     print(f"SCORE — Team A: {self.teams['A'].score}  Team B: {self.teams['B'].score}")
-                    self.sound.play('line')
+                    self.sound.play('score')
                 elif team_id == 'B' and proj.y <= TEAM_A_BASE_ROW:
                     proj.active = False
                     self.teams['B'].score += proj.points
@@ -624,8 +778,9 @@ class BattleGame:
                     if proj.points >= 3:
                         self.explosions.append({'x': proj.x, 'y': TEAM_A_BASE_ROW,
                                                 'color': VIOLET, 'start': time.time(), 'ultimate': True})
+                        self.sound.play('ultimate_hit')
                     print(f"SCORE — Team A: {self.teams['A'].score}  Team B: {self.teams['B'].score}")
-                    self.sound.play('line')
+                    self.sound.play('score')
                 elif proj.y < 0 or proj.y >= BOARD_HEIGHT:
                     proj.active = False
 
