@@ -24,8 +24,8 @@ import struct
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
 CONFIG_FILE        = os.path.join(os.path.dirname(__file__), "eye_ctrl_config.json")
-UDP_DEVICE_PORT    = 4626   # send light commands to device
-UDP_RECEIVER_PORT  = 7800   # listen for button events from device
+UDP_DEVICE_PORT    = 9999   # send light commands to device
+UDP_RECEIVER_PORT  = 9998   # listen for button events from device
 NUM_CHANNELS       = 4
 LEDS_PER_CHANNEL   = 11     # 0 = Eye, 1-10 = Buttons
 FRAME_DATA_LEN     = LEDS_PER_CHANNEL * NUM_CHANNELS * 3   # 132 bytes
