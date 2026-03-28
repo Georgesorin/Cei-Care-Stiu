@@ -43,6 +43,9 @@ UDP_LISTEN_PORT = CONFIG.get("recv_port", 7271)
 NUM_CHANNELS = 8
 LEDS_PER_CHANNEL = 64
 FRAME_DATA_LENGTH = NUM_CHANNELS * LEDS_PER_CHANNEL * 3
+MATRIX_TOUCH_CHANNELS = 8
+MATRIX_TOUCH_PER_CHANNEL = 64
+MATRIX_TOUCH_COUNT = MATRIX_TOUCH_CHANNELS * MATRIX_TOUCH_PER_CHANNEL
 
 # Board Area: Channels 0-6 (Rows 0-27)
 BOARD_WIDTH = 16
@@ -94,25 +97,38 @@ FONT = {
 INPUT_REPEAT_RATE = 0.25  # Seconds per move when holding
 INPUT_INITIAL_DELAY = 0.5 # Initial delay before repeat starts
 
+def calculate_checksum(data):
+    acc = sum(data)
+    idx = acc & 0xFF
+    return PASSWORD_ARRAY[idx] if idx < len(PASSWORD_ARRAY) else 0
 
 class Player:
     """Player class for tracking score and input control"""
     def __init__(self):
         self.points = 0
+        self.player_scores = {}
         self.control_rows = [1, 2, 3, 4, 5]  # Control pad rows for groups 0-4
         self.control_column = 1  # Control pads are at column 1
         self.last_scored_states = {}  # Track which flashes we've already scored
+
+    def add_point(self, player_id):
+        """Increment total score and per-player score."""
+        self.points += 1
+        self.player_scores[player_id] = self.player_scores.get(player_id, 0) + 1
 
     def get_led_index(self, x, y):
         """Convert (x, y) board position to LED index for button checking"""
         # This maps board coordinates to button state index
         channel = y // 4
         row_in_channel = y % 4
+
         if row_in_channel % 2 == 0:
             led_index = row_in_channel * 16 + x
         else:
             led_index = row_in_channel * 16 + (15 - x)
-        return led_index
+
+        # Return full matrix touch index (0..511), not just per-channel 0..63.
+        return channel * 64 + led_index
 
     def check_hit(self, group_index, x, y, button_states):
         """
@@ -135,7 +151,7 @@ class Player:
                 if state_key not in self.last_scored_states:
                     self.points += 1
                     self.last_scored_states[state_key] = True
-                    print(f"Hit! Points: {self.points}")
+                    print("Hit! Points: ", self.points)
                     return True
         
         return False
@@ -145,12 +161,6 @@ class Player:
         state_key = (group_index, y)
         if state_key in self.last_scored_states:
             del self.last_scored_states[state_key]
-
-
-def calculate_checksum(data):
-    acc = sum(data)
-    idx = acc & 0xFF
-    return PASSWORD_ARRAY[idx] if idx < len(PASSWORD_ARRAY) else 0
 
 class TestGame:
     def __init__(self):
@@ -165,25 +175,67 @@ class TestGame:
         
         # Initialize player and controls
         self.player = Player()
-        self.button_states = [False] * 64  # Track button press states
+        self.button_states = [False] * MATRIX_TOUCH_COUNT  # Track touch states across full 16x32 matrix
+        self.prev_button_states = [False] * MATRIX_TOUCH_COUNT  # Edge detection: tap = False -> True
+        # 10-player mapping: each player owns a row-band and has 5 lane buttons.
+        self.player_button_map = {}
+
+    def _build_player_button_map(self, row_groups_left, row_groups_right, left_edge, right_edge):
+        """Build 10-player button map from row-group bands.
+
+        Player ownership model:
+        - P1: left, first element of each lane tuple
+        - P2: right, first element of each lane tuple
+        - P3: left, second element ... and so on.
+        """
+        player_map = {}
+        lanes_per_side = len(row_groups_left)
+        bands = len(row_groups_left[0]) if row_groups_left else 0
+
+        for band_index in range(bands):
+            left_player_id = (band_index * 2) + 1
+            right_player_id = left_player_id + 1
+
+            left_buttons = []
+            right_buttons = []
+
+            for lane_index in range(lanes_per_side):
+                left_row = row_groups_left[lane_index][band_index]
+                right_row = row_groups_right[lane_index][band_index]
+
+                left_buttons.append(self.player.get_led_index(left_edge, left_row))
+                right_buttons.append(self.player.get_led_index(right_edge, right_row))
+
+            player_map[left_player_id] = left_buttons
+            player_map[right_player_id] = right_buttons
+
+        self.player_button_map = player_map
 
     def reset_board(self):
         self.board = [[BLACK for _ in range(BOARD_WIDTH)] for _ in range(BOARD_HEIGHT)]
 
     def set_led(self, buffer, x, y, color):
-        if x < 0 or x >= 16: return
+        if x < 0 or x >= 16:
+            return
+
         channel = y // 4
-        if channel >= 8: return
+        if channel >= 8:
+            return
+
         row_in_channel = y % 4
-        if row_in_channel % 2 == 0: led_index = row_in_channel * 16 + x
-        else: led_index = row_in_channel * 16 + (15 - x)
+
+        if row_in_channel % 2 == 0:
+            led_index = row_in_channel * 16 + x
+        else:
+            led_index = row_in_channel * 16 + (15 - x)
+
         block_size = NUM_CHANNELS * 3
         offset = led_index * block_size + channel
-        if offset + NUM_CHANNELS*2 < len(buffer):
-            buffer[offset] = color[1] # GREEN (Swap for hardware)
-            buffer[offset + NUM_CHANNELS] = color[0] # RED (Swap for hardware)
-            buffer[offset + NUM_CHANNELS*2] = color[2]
 
+        if offset + NUM_CHANNELS * 2 < len(buffer):
+            buffer[offset] = color[1]  # GREEN (Swap for hardware)
+            buffer[offset + NUM_CHANNELS] = color[0]  # RED (Swap for hardware)
+            buffer[offset + NUM_CHANNELS*2] = color[2]
 
     def start_game(self):
         with self.lock:
@@ -194,18 +246,10 @@ class TestGame:
     def render(self):
         # Create a blank frame buffer
         frame_buffer = bytearray(FRAME_DATA_LENGTH)
-        
-        # Matrix Rain effect with 4 columns in the middle, each with unique color
-        MATRIX_COLORS = [MAGENTA, CYAN, GREEN, RED]  # (255,0,255), (0,255,255), (0,255,0), (255,0,0)
-        ACTIVE_COLUMNS = [6, 7, 8, 9]  # 4 columns in the middle of 16-column display
-        
-        if not hasattr(self, 'rain_drops'):
-            self.rain_drops = {}
+
+        if not hasattr(self, 'time_counter'):
             self.time_counter = 0
-            # Initialize drops only for active columns
-            for i, col in enumerate(ACTIVE_COLUMNS):
-                self.rain_drops[col] = random.randint(-10, 0)
-        
+
         # Fade existing pixels
         for y in range(BOARD_HEIGHT):
             for x in range(BOARD_WIDTH):
@@ -217,7 +261,7 @@ class TestGame:
                 faded_color = (r_fade, g_fade, b_fade)
                 self.set_led(frame_buffer, x, y, faded_color)
                 self.board[y][x] = faded_color  # Update board with faded color
-        
+
         # ===========================================
         # MATRIX BORDER AND CENTER COLUMN
         # ===========================================
@@ -269,28 +313,30 @@ class TestGame:
 
         # Left-moving groups (original)
         ROW_GROUPS_LEFT = [
-            (1, 7, 13, 19, 26),   # Group 0 (Top)
-            (2, 8, 14, 20, 27),   # Group 1 (Upper-Middle)
-            (3, 9, 15, 21, 28),   # Group 2 (Upper-Middle)
-            (4, 10, 16, 22, 29),  # Group 3 (Middle)
-            (5, 11, 17, 23, 30)   # Group 4 (Bottom)
+            (1, 7, 13, 19, 25),   # Group 0 (Top)
+            (2, 8, 14, 20, 26),   # Group 1 (Upper-Middle)
+            (3, 9, 15, 21, 27),   # Group 2 (Upper-Middle)
+            (4, 10, 16, 22, 28),  # Group 3 (Middle)
+            (5, 11, 17, 23, 29)   # Group 4 (Bottom)
         ]
 
         # Right-moving groups (mirrored)
         ROW_GROUPS_RIGHT = [
-            (1, 7, 13, 19, 26),   # Group 5 (Top, moving right)
-            (2, 8, 14, 20, 27),   # Group 6 (Upper-Middle, moving right)
-            (3, 9, 15, 21, 28),   # Group 7 (Upper-Middle, moving right)
-            (4, 10, 16, 22, 29),  # Group 8 (Middle, moving right)
-            (5, 11, 17, 23, 30)   # Group 9 (Bottom, moving right)
+            (1, 7, 13, 19, 25),   # Group 5 (Top, moving right)
+            (2, 8, 14, 20, 26),   # Group 6 (Upper-Middle, moving right)
+            (3, 9, 15, 21, 27),   # Group 7 (Upper-Middle, moving right)
+            (4, 10, 16, 22, 28),  # Group 8 (Middle, moving right)
+            (5, 11, 17, 23, 29)   # Group 9 (Bottom, moving right)
         ]
 
         # All groups combined
         ROW_GROUPS = ROW_GROUPS_LEFT + ROW_GROUPS_RIGHT
 
+        if not self.player_button_map:
+            self._build_player_button_map(ROW_GROUPS_LEFT, ROW_GROUPS_RIGHT, LEFT_EDGE, RIGHT_EDGE)
+
         # Colors for each group (shared across all rows in that group)
         GROUP_COLORS = [MAGENTA, CYAN, GREEN, RED, YELLOW] * 2  # Repeat for both sides
-
 
         # ===========================================
         # INITIALIZE DROP STATES (FIRST TIME ONLY)
@@ -347,7 +393,6 @@ class TestGame:
 
             self.global_spawn_timer = 0
 
-
         # ===========================================
         # PROCESS EACH GROUP'S DROP STATE
         # ===========================================
@@ -381,17 +426,30 @@ class TestGame:
             elif state == 'flashing':
                 self.group_flash_timers[group_index] += 1
                 
-                # Check for player hits during flashing (when tile is white)
-                if group_index == 0:
-                    drop_x = self.group_positions[group_index]
-                    for row in group_rows:
-                        # Get the LED index for this button pad
-                        led_index = self.player.get_led_index(drop_x, row)
-                        # Check if button is pressed while tile is white
-                        if led_index < len(self.button_states) and self.button_states[led_index]:
-                            self.player.points += 1
-                            print(f"HIT! Points: {self.player.points}")
-                
+                # 10-player hit detection:
+                # Players are grouped by row-band and side (left/right).
+                lane_index = group_index % 5
+                is_left_side_group = group_index < 5
+
+                for band_index in range(5):
+                    player_id = (band_index * 2) + (1 if is_left_side_group else 2)
+                    player_buttons = self.player_button_map.get(player_id, [])
+
+                    if lane_index >= len(player_buttons):
+                        continue
+
+                    lane_button = player_buttons[lane_index]
+                    is_pressed = lane_button < len(self.button_states) and self.button_states[lane_button]
+                    was_pressed = lane_button < len(self.prev_button_states) and self.prev_button_states[lane_button]
+
+                    # Score only on a tap edge while the note is in the hit window.
+                    if is_pressed and not was_pressed:
+                        self.player.add_point(player_id)
+                        print(
+                            f"P{player_id} HIT lane {lane_index} | "
+                            f"P{player_id} Score: {self.player.player_scores[player_id]}"
+                        )
+
                 if self.group_flash_timers[group_index] >= 3:
                     self.group_states[group_index] = 'waiting'
 
@@ -411,10 +469,11 @@ class TestGame:
 
         # Step 3: Update animation timing
         self.time_counter += 1
+        self.prev_button_states = self.button_states.copy()
 
         # Return the completed frame buffer
         return frame_buffer
-    
+
 
     def tick(self):
         with self.lock:
@@ -449,18 +508,18 @@ class NetworkManager:
         self.sock_recv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.running = True
         self.sequence_number = 0
-        self.prev_button_states = [False] * 64
-        
+        self.prev_button_states = [False] * MATRIX_TOUCH_COUNT
+
         # Auto-Bind Logic: If no bind_ip specified, we stay on 0.0.0.0 (default)
         bind_ip = CONFIG.get("bind_ip", "0.0.0.0")
-        
+
         # We try to bind if a specific IP was requested, but fallback gracefully
         if bind_ip != "0.0.0.0":
-            try: 
+            try:
                 self.sock_send.bind((bind_ip, 0))
-            except Exception as e: 
+            except Exception as e:
                 print(f"Warning: Could not bind send socket to {bind_ip} (Routing via default): {e}")
-        
+
         try:
             self.sock_recv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.sock_recv.bind(("0.0.0.0", UDP_LISTEN_PORT))
@@ -472,16 +531,17 @@ class NetworkManager:
         while self.running:
             frame = self.game.render()
             self.send_packet(frame)
-            time.sleep(0.05) 
+            time.sleep(0.05)
 
     def send_packet(self, frame_data):
         # Protocol v11 Implementation
         self.sequence_number = (self.sequence_number + 1) & 0xFFFF
-        if self.sequence_number == 0: self.sequence_number = 1
-        
+        if self.sequence_number == 0:
+            self.sequence_number = 1
+
         target_ip = UDP_SEND_IP
         port = UDP_SEND_PORT
-        
+
         # --- 1. Start Packet ---
         rand1 = random.randint(0, 127)
         rand2 = random.randint(0, 127)
@@ -492,12 +552,13 @@ class NetworkManager:
             self.sequence_number & 0xFF,
             0x00, 0x00, 0x00 
         ])
-        start_packet.append(0x0E) # Force Checksum
-        start_packet.append(0x00) 
-        try: 
+        start_packet.append(0x0E)  # Force Checksum
+        start_packet.append(0x00)
+        try:
             self.sock_send.sendto(start_packet, (target_ip, port))
             self.sock_send.sendto(start_packet, ("127.0.0.1", port))
-        except: pass
+        except:
+            pass
 
         # --- 2. FFF0 Packet ---
         rand1 = random.randint(0, 127)
@@ -524,10 +585,11 @@ class NetworkManager:
         fff0_packet.append(0x1E) # Force Checksum
         fff0_packet.append(0x00) 
         
-        try: 
+        try:
             self.sock_send.sendto(fff0_packet, (target_ip, port))
             self.sock_send.sendto(fff0_packet, ("127.0.0.1", port))
-        except: pass
+        except:
+            pass
         
         # --- 3. Data Packets ---
         chunk_size = 984 
@@ -561,10 +623,11 @@ class NetworkManager:
                 
             packet.append(0x00)
             
-            try: 
+            try:
                 self.sock_send.sendto(packet, (target_ip, port))
                 self.sock_send.sendto(packet, ("127.0.0.1", port))
-            except: pass
+            except:
+                pass
             
             data_packet_index += 1
             time.sleep(0.005) # Slight delay
@@ -579,30 +642,38 @@ class NetworkManager:
             self.sequence_number & 0xFF,
             0x00, 0x00, 0x00 
         ])
-        end_packet.append(0x0E) 
-        end_packet.append(0x00) 
-        try: 
+        end_packet.append(0x0E)
+        end_packet.append(0x00)
+        try:
             self.sock_send.sendto(end_packet, (target_ip, port))
             self.sock_send.sendto(end_packet, ("127.0.0.1", port))
-        except: pass
+        except:
+            pass
 
     def recv_loop(self):
         while self.running:
             try:
-                data, _ = self.sock_recv.recvfrom(2048)
-                if len(data) >= 1373 and data[0] == 0x88:
-                    offset = 2 + (7 * 171) + 1 
-                    ch8_data = data[offset : offset + 170]
-                    for led_idx, val in enumerate(ch8_data):
-                        if led_idx >= 64: break
-                        is_pressed = (val == 0xCC)
-                        
-                        # Sync state to game active list
-                        # Logic now handled in Game.tick() -> process_inputs()
-                        self.game.button_states[led_idx] = is_pressed
-                        
-            except Exception:
-                pass
+                data, addr = self.sock_recv.recvfrom(2048)
+
+                # Simulator packets contain per-channel touch bytes in 171-byte blocks.
+                # Parse all channels so taps from upper and lower matrix are both visible.
+                if len(data) >= 1264 and data[0] == 0x88:
+                    new_states = [False] * MATRIX_TOUCH_COUNT
+
+                    for channel in range(MATRIX_TOUCH_CHANNELS):
+                        base = 2 + (channel * 171) + 1
+                        for led in range(MATRIX_TOUCH_PER_CHANNEL):
+                            source_idx = base + led
+                            if source_idx < len(data):
+                                dst_idx = channel * MATRIX_TOUCH_PER_CHANNEL + led
+                                new_states[dst_idx] = (data[source_idx] == 0xCC)
+
+                    self.game.button_states = new_states
+
+                    self.prev_button_states = self.game.button_states.copy()
+
+            except Exception as e:
+                print(f"[RECV ERROR] {e}")
 
     def start_bg(self):
         t1 = threading.Thread(target=self.send_loop)
@@ -627,6 +698,7 @@ if __name__ == "__main__":
     gt.start()
 
     print("Game is running. Press Ctrl+C to exit.")
+    print("Commands: exit")
           
     try:
         while game.running:

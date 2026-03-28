@@ -115,33 +115,7 @@ class FallingBlocksGame:
                     if self.score % 10 == 0 and self.speed > 1:
                         self.speed -= 1  # Increase speed every 10 points
 
-    def process_inputs(self):
-        # Simple: use left and right buttons for player 0
-        left_pressed = self.button_states[31]  # LED 31 is left for player 0
-        right_pressed = self.button_states[29]  # LED 29 is right for player 0
-
-        if self.game_over:
-            # Any button press to restart
-            if any(self.button_states) and not any(self.prev_button_states):
-                self.reset_game()
-        else:
-            if left_pressed and not self.prev_button_states[31] and self.basket_x > 0:
-                self.basket_x -= 1
-            if right_pressed and not self.prev_button_states[29] and self.basket_x + self.basket_width < BOARD_WIDTH:
-                self.basket_x += 1
-
-        self.prev_button_states = self.button_states[:]
-
-    def reset_game(self):
-        self.board = [[BLACK for _ in range(BOARD_WIDTH)] for _ in range(BOARD_HEIGHT)]
-        self.basket_x = BOARD_WIDTH // 2 - 2
-        self.blocks = []
-        self.score = 0
-        self.missed = 0
-        self.speed = 1
-        self.frame_count = 0
-        self.game_over = False
-
+    
     def render(self):
         buffer = bytearray(FRAME_DATA_LENGTH)
 
