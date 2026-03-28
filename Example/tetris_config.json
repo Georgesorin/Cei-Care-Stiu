@@ -1,7 +1,0 @@
-{
-    "device_ip": "255.255.255.255",
-    "send_port": 9999,
-    "recv_port": 9998,
-    "bind_ip": "0.0.0.0",
-    "bgm_path": "Lady Gaga - Judas (Lyrics) - bemu (128k).wav"
-}
