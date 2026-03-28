@@ -13,8 +13,8 @@ _CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eye_sim
 
 def _load_config():
     defaults = {
-        "send_port": 7800,
-        "recv_port": 4626,
+        "send_port": 9998,
+        "recv_port": 9999,
         "device_ip": "255.255.255.255",
         "last_used_ports": []
     }
