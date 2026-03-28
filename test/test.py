@@ -336,7 +336,7 @@ class PianoController:
             self.sample_bank = None
         
         # Build piano keyboard mapping on both sides.
-        self._build_piano_column_mapping()
+        self._build_piano_column_mapping(left_enabled=True, right_enabled=True)
         
         if PYGAME_AVAILABLE:
             try:
@@ -349,15 +349,17 @@ class PianoController:
         else:
             self.mixer_available = False
 
-    def _build_piano_column_mapping(self):
+    def _build_piano_column_mapping(self, left_enabled=True, right_enabled=True):
         """
         Build mapping for vertical piano keyboard columns on both sides.
         Border columns (0-1 left, 14-15 right) are visual only.
         Playable columns: 2 left, 13 right (single column each side)
         Note progression: bottom row = lowest note, top row = highest note
         """
-        left_columns_x = [2]
-        right_columns_x = [BOARD_WIDTH - 3]
+        self._button_to_note_index = {}
+        self._button_side_map = {}
+        left_columns_x = [2] if left_enabled else []
+        right_columns_x = [BOARD_WIDTH - 3] if right_enabled else []
         note_count = min(len(self.note_frequencies), BOARD_HEIGHT)
 
         for note_idx in range(note_count):
@@ -373,6 +375,10 @@ class PianoController:
                 right_button_idx = self._get_led_index(x, y)
                 self._button_to_note_index[right_button_idx] = note_idx
                 self._button_side_map[right_button_idx] = "right"
+
+    def set_active_sides(self, left_enabled=True, right_enabled=True):
+        """Limit playable piano columns to active team side(s)."""
+        self._build_piano_column_mapping(left_enabled=left_enabled, right_enabled=right_enabled)
 
         
 
@@ -779,8 +785,13 @@ class MidiSongPlayer:
         self.finished = False
         self._current_elapsed = 0.0
         self._update_counter = 0
+        self.single_side = None  # None, 'left', or 'right'
         self._load_midi(midi_path)
         self._reset_song_state()
+
+    def set_single_side(self, side):
+        """Force all notes to one team side (used when only one team has players)."""
+        self.single_side = side if side in ('left', 'right') else None
 
     def _reset_song_state(self):
         """Reset runtime song state so the same MIDI can be played again."""
@@ -791,7 +802,12 @@ class MidiSongPlayer:
         self.song_started = False
         self._current_elapsed = 0.0
         self._update_counter = 0
-        self._going_right = True          # current travel direction
+        if self.single_side == 'left':
+            self._going_right = False
+        elif self.single_side == 'right':
+            self._going_right = True
+        else:
+            self._going_right = True
         self._next_interval_at = self.DIRECTION_INTERVAL  # elapsed time of next change
 
     def _load_midi(self, path):
@@ -878,7 +894,7 @@ class MidiSongPlayer:
             queued_this_frame += 1
 
         # Check 10-second interval: toggle direction.
-        if elapsed >= self._next_interval_at:
+        if self.single_side is None and elapsed >= self._next_interval_at:
             self._going_right = not self._going_right
             self._next_interval_at += self.DIRECTION_INTERVAL
 
@@ -888,17 +904,29 @@ class MidiSongPlayer:
             n = self.spawn_queue.pop(0)
             spawned_this_frame += 1
             budget -= 1
-            # Use forced_side if present (hard mode), otherwise current direction
-            going_right = n.get('forced_side', 'right' if self._going_right else 'left') == 'right'
+            # In single-side mode, always send notes toward that side.
+            if self.single_side == 'left':
+                going_right = False
+            elif self.single_side == 'right':
+                going_right = True
+            else:
+                # Use forced_side if present (hard mode), otherwise current direction.
+                going_right = n.get('forced_side', 'right' if self._going_right else 'left') == 'right'
             # Pick side, direction, and color set
             if going_right:
-                spawn_x   = self.MIDDLE_COL_RIGHT
+                if self.single_side is not None:
+                    spawn_x = self.TARGET_COL_LEFT
+                else:
+                    spawn_x = self.MIDDLE_COL_RIGHT
                 target_x  = self.TARGET_COL_RIGHT
                 dx        = self.MOVE_SPEED
                 color_natural = self.COLOR_NATURAL_RIGHT
                 color_sharp   = self.COLOR_SHARP_RIGHT
             else:
-                spawn_x   = self.MIDDLE_COL_LEFT
+                if self.single_side is not None:
+                    spawn_x = self.TARGET_COL_RIGHT
+                else:
+                    spawn_x = self.MIDDLE_COL_LEFT
                 target_x  = self.TARGET_COL_LEFT
                 dx        = -self.MOVE_SPEED
                 color_natural = self.COLOR_NATURAL_LEFT
@@ -1087,7 +1115,46 @@ class TestGame:
 
         # Side-select state
         self.side_select_start_time = None
-        self.SIDE_SELECT_DURATION = 2.0  # seconds
+        self.SIDE_SELECT_DURATION = 4.0  # seconds
+        self.single_team_side = None  # None, 'left', or 'right'
+        self.active_piano_sides = {'left': True, 'right': True}
+
+    def _button_idx_to_board_xy(self, button_idx):
+        """Convert touch index (0..511) to board coordinates."""
+        channel = button_idx // 64
+        led_index = button_idx % 64
+        row_in_channel = led_index // 16
+        col_in_row = led_index % 16
+        y = channel * 4 + row_in_channel
+        if row_in_channel % 2 == 0:
+            x = col_in_row
+        else:
+            x = 15 - col_in_row
+        return x, y
+
+    def _get_side_select_press_counts(self):
+        left_count = 0
+        right_count = 0
+        mid = BOARD_WIDTH // 2
+        for btn_idx, pressed in enumerate(self.button_states):
+            if not pressed:
+                continue
+            x, y = self._button_idx_to_board_xy(btn_idx)
+            if y < 0 or y >= BOARD_HEIGHT:
+                continue
+            if x < mid:
+                left_count += 1
+            else:
+                right_count += 1
+        return left_count, right_count
+
+    def _apply_side_mode(self):
+        left_enabled = self.single_team_side in (None, 'left')
+        right_enabled = self.single_team_side in (None, 'right')
+        self.active_piano_sides = {'left': left_enabled, 'right': right_enabled}
+        self.piano.set_active_sides(left_enabled=left_enabled, right_enabled=right_enabled)
+        if self.midi_player:
+            self.midi_player.set_single_side(self.single_team_side)
 
     def set_led(self, buffer, x, y, color):
         if x < 0 or x >= BOARD_WIDTH:
@@ -1283,6 +1350,7 @@ class TestGame:
             midi_path = os.path.join(test_dir, mid_files[0])
         try:
             self.midi_player = MidiSongPlayer(midi_path, self.piano, difficulty=difficulty)
+            self.midi_player.set_single_side(self.single_team_side)
             print(f"Lobby: loaded {os.path.basename(midi_path)} ({difficulty})", flush=True)
         except Exception as e:
             print(f"Failed to load MIDI: {e}", flush=True)
@@ -1447,16 +1515,18 @@ class TestGame:
             key_color = BLACK if note_pos in sharp_note_positions else WHITE
 
             # Left border (columns 0 and 1)
-            self.set_led(frame_buffer, 0, y, key_color)
-            self.board[y][0] = key_color
-            self.set_led(frame_buffer, 1, y, key_color)
-            self.board[y][1] = key_color
+            left_color = key_color if self.active_piano_sides.get('left', True) else DIM_DARK_BLUE
+            self.set_led(frame_buffer, 0, y, left_color)
+            self.board[y][0] = left_color
+            self.set_led(frame_buffer, 1, y, left_color)
+            self.board[y][1] = left_color
 
             # Right border (last two columns)
-            self.set_led(frame_buffer, BOARD_WIDTH - 2, y, key_color)
-            self.board[y][BOARD_WIDTH - 2] = key_color
-            self.set_led(frame_buffer, BOARD_WIDTH - 1, y, key_color)
-            self.board[y][BOARD_WIDTH - 1] = key_color
+            right_color = key_color if self.active_piano_sides.get('right', True) else DIM_DARK_BLUE
+            self.set_led(frame_buffer, BOARD_WIDTH - 2, y, right_color)
+            self.board[y][BOARD_WIDTH - 2] = right_color
+            self.set_led(frame_buffer, BOARD_WIDTH - 1, y, right_color)
+            self.board[y][BOARD_WIDTH - 1] = right_color
 
         # ===========================================
         # HORIZONTAL MATRIX RAIN FROM CENTER AREA
@@ -1521,12 +1591,23 @@ class TestGame:
                     self._load_midi_by_difficulty(winner)
                     self.state = 'SIDE_SELECT'
                     self.side_select_start_time = time.time()
-                    print("Choose your side! (5 seconds)", flush=True)
+                    print(f"Choose your side! ({self.SIDE_SELECT_DURATION:.0f} seconds)", flush=True)
                 return
 
             if self.state == 'SIDE_SELECT':
                 elapsed = time.time() - self.side_select_start_time
                 if elapsed >= self.SIDE_SELECT_DURATION:
+                    left_pressed, right_pressed = self._get_side_select_press_counts()
+                    if left_pressed > 0 and right_pressed == 0:
+                        self.single_team_side = 'left'
+                    elif right_pressed > 0 and left_pressed == 0:
+                        self.single_team_side = 'right'
+                    else:
+                        self.single_team_side = None
+
+                    self._apply_side_mode()
+                    mode_label = self.single_team_side.upper() if self.single_team_side else 'BOTH'
+                    print(f"Side select result: left={left_pressed}, right={right_pressed} -> {mode_label}", flush=True)
                     self.start_game()
                 return
 
