@@ -914,19 +914,13 @@ class MidiSongPlayer:
                 going_right = n.get('forced_side', 'right' if self._going_right else 'left') == 'right'
             # Pick side, direction, and color set
             if going_right:
-                if self.single_side is not None:
-                    spawn_x = self.TARGET_COL_LEFT
-                else:
-                    spawn_x = self.MIDDLE_COL_RIGHT
+                spawn_x   = self.MIDDLE_COL_RIGHT
                 target_x  = self.TARGET_COL_RIGHT
                 dx        = self.MOVE_SPEED
                 color_natural = self.COLOR_NATURAL_RIGHT
                 color_sharp   = self.COLOR_SHARP_RIGHT
             else:
-                if self.single_side is not None:
-                    spawn_x = self.TARGET_COL_RIGHT
-                else:
-                    spawn_x = self.MIDDLE_COL_LEFT
+                spawn_x   = self.MIDDLE_COL_LEFT
                 target_x  = self.TARGET_COL_LEFT
                 dx        = -self.MOVE_SPEED
                 color_natural = self.COLOR_NATURAL_LEFT
