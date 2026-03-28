@@ -27,7 +27,8 @@ def _load_config():
         "device_ip": "255.255.255.255",
         "send_port": 9999,
         "recv_port": 9998,
-        "bind_ip": "0.0.0.0"
+        "bind_ip": "0.0.0.0",
+        "bgm_path": "_sfx/bgm.wav"
     }
     try:
         if os.path.exists(_CFG_FILE):
@@ -51,6 +52,10 @@ FRAME_DATA_LENGTH = NUM_CHANNELS * LEDS_PER_CHANNEL * 3
 BOARD_WIDTH  = 16
 BOARD_HEIGHT = 32
 INPUT_CHANNEL = 7
+
+# --- Background Music ---
+BGM_FILENAME = "Lady Gaga - Judas (Lyrics) - bemu (128k).wav"
+BGM_VOLUME   = 0.5   # 0.0 = silent, 1.0 = full volume
 
 # --- Colors (R, G, B) ---
 BLACK   = (0,   0,   0)
@@ -118,8 +123,6 @@ MAX_POWERUPS_ON_BOARD   = 3
 POWERUP_SPAWN_ROW_MIN   = 2       # keep clear of first/last 2 rows
 POWERUP_SPAWN_ROW_MAX   = 29
 
-DOUBLE_PRESS_WINDOW  = 1.0   # max seconds between first and second press
-DOUBLE_PRESS_TIMEOUT = 1.5   # first press expires after this
 
 # Team A is at the TOP (row 0), shoots downward (+1)
 # Team B is at the BOTTOM (row 31), shoots upward (-1)
@@ -149,7 +152,6 @@ def global_btn_idx(y, col):
 
 # Power-up types
 PTYPE_SPEED   = 1   # Yellow  — 2× projectile speed for 15s
-PTYPE_RAPID   = 2   # Green   — single tap fires for 15s
 PTYPE_DOUBLE  = 3   # Magenta — fire 2 projectiles (col±1) for 15s
 PTYPE_ULTIMATE = 4  # Red 1×1 — unblockable 3-point shot
 
@@ -158,7 +160,6 @@ DARK_RED = (139, 0,   0)
 
 PTYPE_COLORS = {
     PTYPE_SPEED:    YELLOW,
-    PTYPE_RAPID:    GREEN,
     PTYPE_DOUBLE:   MAGENTA,
     PTYPE_ULTIMATE: RED,
 }
@@ -360,13 +361,12 @@ class SoundManager:
         except Exception as e:
             print(f"SFX synthesis failed: {e}")
 
-        BGM_PATH = r"C:\Users\rnech\Desktop\hackaton\Cei-Care-Stiu\Example\_sfx\Lady Gaga - Judas (Lyrics) - bemu (128k).wav"
-        if not os.path.exists(BGM_PATH):
-            BGM_PATH = "_sfx/bgm.wav"   # fallback to default
+        _sfx_dir  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_sfx")
+        BGM_PATH  = os.path.join(_sfx_dir, BGM_FILENAME)
         if os.path.exists(BGM_PATH):
             try:
                 pygame.mixer.music.load(BGM_PATH)
-                pygame.mixer.music.set_volume(0.4)
+                pygame.mixer.music.set_volume(BGM_VOLUME)
                 print(f"BGM loaded OK: {BGM_PATH}")
             except Exception as e:
                 print(f"Failed to load BGM as WAV ({e}), trying as MP3...")
@@ -374,7 +374,7 @@ class SoundManager:
                     mp3_path = BGM_PATH.replace(".wav", ".mp3")
                     # Try loading the .wav path directly via pygame (it handles mp3 too)
                     pygame.mixer.music.load(BGM_PATH)
-                    pygame.mixer.music.set_volume(0.4)
+                    pygame.mixer.music.set_volume(BGM_VOLUME)
                     print("BGM loaded OK as MP3")
                 except Exception as e2:
                     print(f"BGM load failed entirely: {e2}")
@@ -439,7 +439,6 @@ class TeamData:
         self.input_y   = input_y    # board y-row where this team's buttons live
         self.score               = 0
         self.effect_speed_until  = None
-        self.effect_rapid_until  = None
         self.effect_double_until = None
 
     def led_idx_for_col(self, col):
@@ -449,7 +448,6 @@ class TeamData:
     def reset(self):
         self.score               = 0
         self.effect_speed_until  = None
-        self.effect_rapid_until  = None
         self.effect_double_until = None
 
 
@@ -484,7 +482,6 @@ class BattleGame:
 
         # Double-press state per (team_id, col):
         # {'state': 'idle'|'first'|'released', 'first_press_time': float}
-        self.col_press_states = {}
 
         # Timers
         self.last_proj_tick     = {'A': 0.0, 'B': 0.0}
@@ -510,7 +507,6 @@ class BattleGame:
             self.power_ups   = []
             self.explosions  = []
             self.ripples     = []
-            self.col_press_states = {}
             now = time.time()
             self.last_proj_tick     = {'A': now, 'B': now}
             self.last_powerup_spawn = now
@@ -624,48 +620,15 @@ class BattleGame:
     # -----------------------------------------------------------------------
 
     def process_inputs(self):
-        now = time.time()
-
         for team_id in ('A', 'B'):
             team = self.teams[team_id]
             for col in range(BOARD_WIDTH):
-                led_idx = team.led_idx_for_col(col)
+                led_idx     = team.led_idx_for_col(col)
                 is_pressed  = self.button_states[led_idx]
                 was_pressed = self.prev_button_states[led_idx]
-                fresh_press = is_pressed and not was_pressed
+                if is_pressed and not was_pressed:          # fresh press → fire immediately
+                    self.fire_projectile(team_id, col)
 
-                key = (team_id, col)
-                ps = self.col_press_states.get(key, {'state': 'idle', 'first_press_time': 0.0})
-
-                if ps['state'] == 'idle':
-                    if fresh_press:
-                        rapid_on = team.effect_rapid_until and now < team.effect_rapid_until
-                        if rapid_on:
-                            self.fire_projectile(team_id, col)
-                            # stay idle — next press also fires immediately
-                        else:
-                            ps = {'state': 'first', 'first_press_time': now}
-
-                elif ps['state'] == 'first':
-                    # Timeout check
-                    if now - ps['first_press_time'] > DOUBLE_PRESS_TIMEOUT:
-                        ps = {'state': 'idle', 'first_press_time': 0.0}
-                    # Released transition
-                    elif not is_pressed and was_pressed:
-                        ps['state'] = 'released'
-
-                elif ps['state'] == 'released':
-                    # Timeout check
-                    if now - ps['first_press_time'] > DOUBLE_PRESS_TIMEOUT:
-                        ps = {'state': 'idle', 'first_press_time': 0.0}
-                    elif fresh_press:
-                        if now - ps['first_press_time'] <= DOUBLE_PRESS_WINDOW:
-                            self.fire_projectile(team_id, col)
-                        ps = {'state': 'idle', 'first_press_time': 0.0}
-
-                self.col_press_states[key] = ps
-
-        # Update prev states after all evaluations
         for i in range(BUTTON_STATES_SIZE):
             self.prev_button_states[i] = self.button_states[i]
 
@@ -841,10 +804,10 @@ class BattleGame:
             y = random.randint(POWERUP_SPAWN_ROW_MIN, POWERUP_SPAWN_ROW_MAX - 1)  # leave room for y+1
             if (x, y) not in occupied and (x+1, y) not in occupied and \
                (x, y+1) not in occupied and (x+1, y+1) not in occupied:
-                ptype = random.choice([PTYPE_SPEED, PTYPE_RAPID, PTYPE_DOUBLE,
+                ptype = random.choice([PTYPE_SPEED, PTYPE_DOUBLE,
                                        PTYPE_ULTIMATE, PTYPE_ULTIMATE])  # weighted slightly
                 self.power_ups.append(PowerUp(x, y, ptype))
-                names = {PTYPE_SPEED: 'SPEED', PTYPE_RAPID: 'RAPID',
+                names = {PTYPE_SPEED: 'SPEED',
                          PTYPE_DOUBLE: 'DOUBLE', PTYPE_ULTIMATE: 'ULTIMATE'}
                 print(f"Power-up spawned: {names[ptype]} at ({x},{y})")
                 break
@@ -856,9 +819,6 @@ class BattleGame:
         if ptype == PTYPE_SPEED:
             team.effect_speed_until  = expiry
             print(f"Team {team_id} got SPEED boost!")
-        elif ptype == PTYPE_RAPID:
-            team.effect_rapid_until  = expiry
-            print(f"Team {team_id} got RAPID FIRE!")
         elif ptype == PTYPE_DOUBLE:
             team.effect_double_until = expiry
             print(f"Team {team_id} got DOUBLE SHOT!")
@@ -878,8 +838,6 @@ class BattleGame:
         for team in self.teams.values():
             if team.effect_speed_until  and now > team.effect_speed_until:
                 team.effect_speed_until  = None
-            if team.effect_rapid_until  and now > team.effect_rapid_until:
-                team.effect_rapid_until  = None
             if team.effect_double_until and now > team.effect_double_until:
                 team.effect_double_until = None
 
@@ -915,23 +873,14 @@ class BattleGame:
             indicator_y = LAUNCHER_ROW_A if team_id == 'A' else LAUNCHER_ROW_B
             if team.effect_speed_until  and now < team.effect_speed_until:
                 self.set_led(buffer, 0, indicator_y, YELLOW)
-            if team.effect_rapid_until  and now < team.effect_rapid_until:
-                self.set_led(buffer, 1, indicator_y, GREEN)
             if team.effect_double_until and now < team.effect_double_until:
-                self.set_led(buffer, 2, indicator_y, MAGENTA)
+                self.set_led(buffer, 1, indicator_y, MAGENTA)
 
     def _render_input_bar_highlight(self, buffer, now):
-        """Show first-press highlights in each team's launcher bar row."""
-        for team_id in ('A', 'B'):
-            launcher_y   = LAUNCHER_ROW_A if team_id == 'A' else LAUNCHER_ROW_B
-            dim_color    = DIM_RED  if team_id == 'A' else DIM_BLUE
-            bright_color = RED      if team_id == 'A' else BLUE
-
-            for col in range(BOARD_WIDTH):
-                key = (team_id, col)
-                ps  = self.col_press_states.get(key, {'state': 'idle'})
-                color = bright_color if ps['state'] in ('first', 'released') else dim_color
-                self.set_led(buffer, col, launcher_y, color)
+        """Draw the dim launcher bar for each team."""
+        for x in range(BOARD_WIDTH):
+            self.set_led(buffer, x, LAUNCHER_ROW_A, DIM_RED)
+            self.set_led(buffer, x, LAUNCHER_ROW_B, DIM_BLUE)
 
     # -----------------------------------------------------------------------
     # Render
@@ -1471,7 +1420,6 @@ class BattleGame:
 
                         # Active power-up aura colours
                         has_speed  = team.effect_speed_until  and now < team.effect_speed_until
-                        has_rapid  = team.effect_rapid_until  and now < team.effect_rapid_until
                         has_double = team.effect_double_until and now < team.effect_double_until
 
                         # --- Beam body: solid bright streak 6 cells behind the head ---
@@ -1508,16 +1456,6 @@ class BattleGame:
                                 mc  = tuple(int(c * fac * 0.7) for c in MAG)
                                 self.set_led(buffer, px - 2, dy, mc)
                                 self.set_led(buffer, px + 2, dy, mc)
-
-                        # --- RAPID aura: crackling green energy ring at head ---
-                        if has_rapid:
-                            GRN = (0, 255, 80)
-                            t_crackle = int(now * 12) % 4
-                            ring = [(0,-1),(1,0),(0,1),(-1,0)]
-                            for ri, (rx, ry) in enumerate(ring):
-                                bright = 1.0 if ri == t_crackle else 0.25
-                                rc = tuple(int(c * bright) for c in GRN)
-                                self.set_led(buffer, px + rx, py + ry, rc)
 
                         # --- Horizontal plasma flare at head ---
                         flare_c = tuple(min(255, int(c * 1.3)) for c in color)
@@ -1556,14 +1494,6 @@ class BattleGame:
                             if dist < 2:
                                 self.set_led(buffer, x, bar_y - team.direction,
                                              (int(180*fac), int(150*fac), 0))
-
-                    if team.effect_rapid_until and now < team.effect_rapid_until:
-                        # RAPID — green crackling pulse across entire bar
-                        crackle = int(now * 15) % 2
-                        for x in range(BOARD_WIDTH):
-                            noise = (x * 37 + int(now * 20)) % 3
-                            fac = 1.0 if (crackle and noise == 0) else 0.45
-                            self.set_led(buffer, x, bar_y, (0, int(200*fac), int(80*fac)))
 
                     if team.effect_double_until and now < team.effect_double_until:
                         # DOUBLE — magenta twin-pulse ripple from centre outward
