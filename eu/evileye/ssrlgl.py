@@ -14,7 +14,7 @@ from tkinter import ttk
 # --- Protocol/Simulator Settings ---
 NUM_CHANNELS = 4
 LEDS_PER_CHANNEL = 11
-EYE_LED_INDEX = 10
+EYE_LED_INDEX = 0
 SIMULATOR_IP = '127.0.0.1'
 # SEND_PORT = 4626  # To simulator (light commands)
 # RECV_PORT = 7800  # From simulator (button events)
@@ -28,8 +28,10 @@ DEVICE_IP = '169.254.182.11'       # Known device IP (link-local)
 DEVICE_SEND_PORT = 4626            # Send light commands to device
 DEVICE_RECV_PORT = 7800            # Receive button events from device
 DISCOVERY_TIMEOUT_SEC = 3  # How long to wait for a hardware response
+SIMULATOR_COLOR_ORDER = 'RGB'
+LIVE_COLOR_ORDER = 'GRB'
 
-# Playable buttons based on your wall layout (all non-eye LEDs).
+# Playable buttons based on your wall layout (buttons 1-10, excluding the eye).
 WALL_PATH = [idx for idx in range(LEDS_PER_CHANNEL) if idx != EYE_LED_INDEX]
 
 # Timings (milliseconds)
@@ -142,14 +144,14 @@ def build_fff0_packet(seq):
 	return build_command_packet(0x8877, 0xFFF0, bytes(payload), seq)
 
 
-def build_frame_data(led_states):
+def build_frame_data(led_states, color_order='RGB'):
 	frame = bytearray(FRAME_DATA_LEN)
 	for (ch, led), (r, g, b) in led_states.items():
 		ch_idx = ch - 1
 		if 0 <= ch_idx < NUM_CHANNELS and 0 <= led < LEDS_PER_CHANNEL:
-			frame[led * 12 + ch_idx] = g
-			frame[led * 12 + 4 + ch_idx] = r
-			frame[led * 12 + 8 + ch_idx] = b
+			components = {'R': r, 'G': g, 'B': b}
+			for plane_idx, component_name in enumerate(color_order):
+				frame[led * 12 + plane_idx * 4 + ch_idx] = components[component_name]
 	return bytes(frame)
 
 # --- Hardware Discovery ---
@@ -254,9 +256,10 @@ def get_monitor_rects():
 
 # --- UDP Communication ---
 class EvilEyeComm:
-	def __init__(self, recv_callback, device_ip, send_port, recv_port):
+	def __init__(self, recv_callback, device_ip, send_port, recv_port, color_order='RGB'):
 		self.device_ip = device_ip
 		self.send_port = send_port
+		self.color_order = color_order
 		self.send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 		self.recv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 		self.recv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -267,7 +270,7 @@ class EvilEyeComm:
 		threading.Thread(target=self._recv_loop, daemon=True).start()
 
 	def send_led_frame(self, led_states):
-		frame = build_frame_data(led_states)
+		frame = build_frame_data(led_states, self.color_order)
 		ep = (self.device_ip, self.send_port)
 		self.seq = (self.seq + 1) & 0xFFFF
 		self.send_sock.sendto(build_start_packet(self.seq), ep)
@@ -302,7 +305,13 @@ class EvilEyeGame(tk.Tk):
 		self._send_port = send_port
 		self._recv_port = recv_port
 		self._is_simulator = (device_ip == SIMULATOR_IP)
-		self.comm = EvilEyeComm(self.on_button_event, device_ip, send_port, recv_port)
+		self.comm = EvilEyeComm(
+			self.on_button_event,
+			device_ip,
+			send_port,
+			recv_port,
+			self._color_order_for_mode(self._is_simulator),
+		)
 		self._device_label_var = tk.StringVar(value=f"Device: {device_ip}:{send_port}")
 		self.status_var = tk.StringVar(value="Press Start Round")
 		self.round_var = tk.StringVar(value="Round: 0")
@@ -553,10 +562,13 @@ class EvilEyeGame(tk.Tk):
 		self._tv_text_var.set(f"{msg}\n\n{line2}\n{line3}")
 
 	def _btn_label(self, led):
-		return led + 1
+		return led
 
 	def _mode_btn_text(self):
 		return "Switch to Live" if self._is_simulator else "Switch to Simulator"
+
+	def _color_order_for_mode(self, is_simulator):
+		return SIMULATOR_COLOR_ORDER if is_simulator else LIVE_COLOR_ORDER
 
 	def _switch_connection(self):
 		if self._is_simulator:
@@ -576,7 +588,13 @@ class EvilEyeGame(tk.Tk):
 		self._send_port = send_port
 		self._recv_port = recv_port
 		self._is_simulator = is_simulator
-		self.comm = EvilEyeComm(self.on_button_event, device_ip, send_port, recv_port)
+		self.comm = EvilEyeComm(
+			self.on_button_event,
+			device_ip,
+			send_port,
+			recv_port,
+			self._color_order_for_mode(is_simulator),
+		)
 		self._device_label_var.set(f"Device: {device_ip}:{send_port}")
 		self._mode_btn.configure(text=self._mode_btn_text(), state="normal")
 		mode = "simulator" if is_simulator else "live"
@@ -620,13 +638,44 @@ class EvilEyeGame(tk.Tk):
 			return
 		self._start_stage(add_step=True)
 
+	def _button_grid_pos(self, led):
+		button_idx = max(0, led - 1)
+		return (button_idx // 5, button_idx % 5)
+
+	def _node_distance(self, node_a, node_b):
+		wall_gap = abs(node_a[0] - node_b[0])
+		wall_gap = min(wall_gap, NUM_CHANNELS - wall_gap)
+		row_a, col_a = self._button_grid_pos(node_a[1])
+		row_b, col_b = self._button_grid_pos(node_b[1])
+		button_gap = abs(row_a - row_b) + abs(col_a - col_b)
+		return wall_gap * 2 + button_gap
+
+	def _pick_next_sequence_node(self):
+		if not self.sequence:
+			return (random.randint(1, NUM_CHANNELS), random.choice(WALL_PATH))
+
+		prev_node = self.sequence[-1]
+		candidates = []
+		for ch in range(1, NUM_CHANNELS + 1):
+			for led in WALL_PATH:
+				node = (ch, led)
+				if node == prev_node:
+					continue
+				distance = self._node_distance(prev_node, node)
+				candidates.append((node, distance))
+
+		nearby = [(node, distance) for node, distance in candidates if distance <= 3]
+		pool = nearby if nearby else candidates
+		weights = [1.0 / (distance + 1) for _node, distance in pool]
+		return random.choices([node for node, _distance in pool], weights=weights, k=1)[0]
+
 	def _start_stage(self, add_step):
 		if self.phase not in ("IDLE", "ROUND_OVER"):
 			return
 
 		self._cancel_jobs()
 		if add_step or not self.sequence:
-			next_node = (random.randint(1, NUM_CHANNELS), random.choice(WALL_PATH))
+			next_node = self._pick_next_sequence_node()
 			self.sequence.append(next_node)
 		self.input_index = 0
 		self.current_show_node = None
@@ -677,7 +726,7 @@ class EvilEyeGame(tk.Tk):
 		self.status_var.set("Green light: enter sequence | Motion strikes: 0")
 		self.log("Input phase started.")
 		self._render_leds()
-		self._schedule_light_toggle()
+		self._light_job = self.after(self._get_input_green_ms(), self._schedule_light_toggle)
 		self._schedule_timeout_check()
 
 	def _schedule_light_toggle(self):
@@ -829,15 +878,10 @@ class EvilEyeGame(tk.Tk):
 		self._flash_leds[node] = (color, time.time() + sec)
 
 	def _eye_color(self):
-		if self.phase == "SHOW":
-			return (255, 180, 0)
-		if self.phase == "INPUT":
-			return (0, 255, 0) if self.green_light else (255, 0, 0)
-		if self.phase == "ROUND_OVER":
-			return (120, 120, 120)
-		if self.phase == "GAME_OVER":
+		# Red when players must freeze; green all other times
+		if self.phase == "INPUT" and not self.green_light:
 			return (255, 0, 0)
-		return (0, 0, 120)
+		return (0, 255, 0)
 
 	def _render_leds(self):
 		now = time.time()
@@ -853,8 +897,11 @@ class EvilEyeGame(tk.Tk):
 		if self.phase == "SHOW" and self.current_show_node:
 			leds[self.current_show_node] = (0, 210, 255)
 
+		# During SHOW, allow button flashes (distractors); during INPUT/other phases,
+		# only eye flashes are applied — buttons stay off outside the simon-says pattern.
 		for node, (color, _until_ts) in self._flash_leds.items():
-			leds[node] = color
+			if self.phase == "SHOW" or node[1] == EYE_LED_INDEX:
+				leds[node] = color
 
 		self._last_led_states = leds
 		self.comm.send_led_frame(self._last_led_states)
@@ -907,7 +954,6 @@ class EvilEyeGame(tk.Tk):
 			if not self.red_warning_used:
 				self.red_warning_used = True
 				self._last_press_ts = now
-				self._flash((channel, led), (255, 0, 0), 0.6)
 				self.status_var.set(
 					f"Warning: moved on RED once (next red move penalizes) | Motion strikes: {self.eye_strikes}/{MAX_EYE_STRIKES}"
 				)
@@ -929,7 +975,6 @@ class EvilEyeGame(tk.Tk):
 		expected = self.sequence[self.input_index]
 		if (channel, led) != expected:
 			self._last_press_ts = now
-			self._flash((channel, led), (255, 0, 0), 0.6)
 			self._render_leds()
 			self._round_failed(
 				f"Wrong button. Expected W{expected[0]} B{self._btn_label(expected[1])}"
@@ -937,7 +982,6 @@ class EvilEyeGame(tk.Tk):
 			return
 
 		self._last_press_ts = now
-		self._flash((channel, led), (0, 255, 120), 0.5)
 		self.log(f"Correct: W{channel} B{self._btn_label(led)}")
 		self.input_index += 1
 
@@ -984,7 +1028,7 @@ class EvilEyeGame(tk.Tk):
 					self._motion_reported_active.discard(ch)
 
 		# Regular wall buttons still use rising-edge detection.
-		rising = {(ch, led) for (ch, led) in (pressed - self.prev_pressed) if led != 0}
+		rising = {(ch, led) for (ch, led) in (pressed - self.prev_pressed) if led != EYE_LED_INDEX}
 		self.prev_pressed = pressed
 
 		for ch, led in sorted(rising):
