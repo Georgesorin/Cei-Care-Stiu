@@ -9,8 +9,8 @@ from tkinter import ttk
 NUM_CHANNELS = 4
 LEDS_PER_CHANNEL = 11
 SIMULATOR_IP = '127.0.0.1'
-SEND_PORT = 7273  # To simulator (light commands)
-RECV_PORT = 7272  # From simulator (button events)
+SEND_PORT = 4626  # To simulator (light commands)
+RECV_PORT = 7800  # From simulator (button events)
 FRAME_DATA_LEN = LEDS_PER_CHANNEL * NUM_CHANNELS * 3
 TRIGGER_PACKET_LEN = 687
 
