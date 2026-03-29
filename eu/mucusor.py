@@ -2599,7 +2599,7 @@ class GameControlUI:
 
         self.root = tk.Tk()
         self.root.title("Protect the car Control")
-        self.root.geometry("500x360")
+        self.root.geometry("500x420")
         self.root.resizable(False, False)
         self.root.protocol("WM_DELETE_WINDOW", self.quit_game)
         self.root.configure(bg=self.ui_bg)
@@ -2612,6 +2612,7 @@ class GameControlUI:
         self.settings_window = None
         self.send_port_var = tk.StringVar(value=str(UDP_SEND_PORT))
         self.recv_port_var = tk.StringVar(value=str(UDP_LISTEN_PORT))
+        self.tutorial_var = tk.BooleanVar(value=True)
 
         self._build_controls()
         self._build_stats_window()
@@ -2771,7 +2772,19 @@ class GameControlUI:
         ).pack(fill="x")
 
         hint = "Presets auto-start. Custom uses Bullets/Minutes/Rounds/Fall speed."
-        tk.Label(self.root, text=hint, fg=self.ui_muted, bg=self.ui_bg).pack(fill="x", padx=12, pady=(4, 8))
+        tk.Label(self.root, text=hint, fg=self.ui_muted, bg=self.ui_bg).pack(fill="x", padx=12, pady=(4, 2))
+
+        tk.Checkbutton(
+            self.root,
+            text="Show tutorial on stats screen before game",
+            variable=self.tutorial_var,
+            bg=self.ui_bg,
+            fg=self.ui_fg,
+            selectcolor=self.ui_panel,
+            activebackground=self.ui_bg,
+            activeforeground=self.ui_fg,
+            font=("Segoe UI", 9),
+        ).pack(anchor="w", padx=12, pady=(2, 6))
 
         tk.Button(
             self.root,
@@ -2951,6 +2964,49 @@ class GameControlUI:
             self.stats_value_labels[key] = value_lbl
 
         self._move_stats_to_second_screen_if_available()
+        self._build_tutorial_overlay()
+
+    def _build_tutorial_overlay(self):
+        self.tutorial_frame = tk.Frame(self.stats_window, bg="#0d1520")
+
+        tk.Label(
+            self.tutorial_frame,
+            text="HOW TO PLAY",
+            bg="#0d1520",
+            fg=self.ui_accent,
+            font=("Segoe UI", 52, "bold"),
+        ).pack(pady=(40, 6))
+
+        tk.Frame(self.tutorial_frame, bg=self.ui_accent, height=3).pack(fill="x", padx=80, pady=(0, 24))
+
+        items = [
+            ("The presidential car drives around the edge of the board.", "#e0e8f0"),
+            ("Protect it — enemy bullets bounce across and will hit the car!", "#e0e8f0"),
+            ("", ""),
+            ("RED bullet  =  1 tap to destroy", "#ff6b6b"),
+            ("PURPLE bullet  =  2 taps to destroy", "#b392f0"),
+            ("BOMB (appears round 3+)  =  3 taps to clear from the car's path", "#f28482"),
+            ("", ""),
+            ("TAP a bullet's column on the LED board to hit it.", "#ffd166"),
+            ("Destroy bullets before they reach the car!", "#ffd166"),
+            ("", ""),
+            ("HP bar = top row  |  Timer bar = second row", "#8ecae6"),
+            ("Survive all rounds to WIN  —  HP drops to 0 = GAME OVER", "#7bd389"),
+        ]
+
+        for text, color in items:
+            if not text:
+                tk.Frame(self.tutorial_frame, bg="#0d1520", height=14).pack()
+                continue
+            tk.Label(
+                self.tutorial_frame,
+                text=text,
+                bg="#0d1520",
+                fg=color,
+                font=("Segoe UI", 26),
+                wraplength=1000,
+                justify="center",
+            ).pack(pady=3)
 
     def _get_windows_monitors(self):
         if os.name != "nt":
@@ -3158,6 +3214,13 @@ class GameControlUI:
             "GAMEOVER": "#ff6b6b",
         }
         self.stats_value_labels["state"].configure(fg=state_colors.get(state, self.ui_fg))
+
+        pre_game_states = {'LOBBY', 'PREFIGHT_FLICKER', 'COUNTDOWN', 'TRANSITION', 'PREPLAY_FLICKER'}
+        if self.tutorial_var.get() and state in pre_game_states:
+            self.tutorial_frame.place(relx=0, rely=0, relwidth=1, relheight=1)
+            self.tutorial_frame.lift()
+        else:
+            self.tutorial_frame.place_forget()
 
     def quit_game(self):
         self.game.running = False
