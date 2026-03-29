@@ -39,7 +39,8 @@ MOTION_COOLDOWN_MS = 900
 RED_LIGHT_GRACE_MS = 350
 RED_MOVE_COOLDOWN_MS = 1400
 MAX_ROUND1_REGRESSIONS = 5
-MOTION_HOLD_MS = 220
+MOTION_CONFIRM_PACKETS = 1
+MOTION_ACTIVE_GAP_MS = 180
 
 PASSWORD_ARRAY = [
 	35, 63, 187, 69, 107, 178, 92, 76, 39, 69, 205, 37, 223, 255, 165, 231,
@@ -276,7 +277,8 @@ class EvilEyeGame(tk.Tk):
 		self._last_light_toggle_ts = 0.0
 		self._last_red_penalty_ts = 0.0
 		self.red_warning_used = False
-		self._motion_started_at = {}
+		self._motion_seen_count = {}
+		self._motion_last_seen_ts = {}
 		self._motion_reported_active = set()
 
 		self._last_led_states = {}
@@ -328,7 +330,8 @@ class EvilEyeGame(tk.Tk):
 		self._last_light_toggle_ts = 0.0
 		self._last_red_penalty_ts = 0.0
 		self.red_warning_used = False
-		self._motion_started_at.clear()
+		self._motion_seen_count.clear()
+		self._motion_last_seen_ts.clear()
 		self._motion_reported_active.clear()
 		self.prev_pressed.clear()
 		self._flash_leds.clear()
@@ -684,19 +687,21 @@ class EvilEyeGame(tk.Tk):
 
 		now = time.time()
 
-		# Motion (LED index 0) is noisy; require a short sustained hold to count.
+		# Motion (LED index 0): packet-based trigger with active-state gating.
 		for ch in range(1, NUM_CHANNELS + 1):
 			node = (ch, 0)
 			if node in pressed:
-				if ch not in self._motion_started_at:
-					self._motion_started_at[ch] = now
-				elif ch not in self._motion_reported_active:
-					if (now - self._motion_started_at[ch]) >= (MOTION_HOLD_MS / 1000.0):
-						self._motion_reported_active.add(ch)
-						self._handle_rising_press(ch, 0)
+				self._motion_last_seen_ts[ch] = now
+				self._motion_seen_count[ch] = self._motion_seen_count.get(ch, 0) + 1
+				if ch not in self._motion_reported_active and self._motion_seen_count[ch] >= MOTION_CONFIRM_PACKETS:
+					self._motion_reported_active.add(ch)
+					self._handle_rising_press(ch, 0)
 			else:
-				self._motion_started_at.pop(ch, None)
-				self._motion_reported_active.discard(ch)
+				last_seen = self._motion_last_seen_ts.get(ch, 0.0)
+				if (now - last_seen) >= (MOTION_ACTIVE_GAP_MS / 1000.0):
+					self._motion_seen_count.pop(ch, None)
+					self._motion_last_seen_ts.pop(ch, None)
+					self._motion_reported_active.discard(ch)
 
 		# Regular wall buttons still use rising-edge detection.
 		rising = {(ch, led) for (ch, led) in (pressed - self.prev_pressed) if led != 0}
