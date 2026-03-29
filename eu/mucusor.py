@@ -2950,6 +2950,82 @@ class GameControlUI:
             value_lbl.pack(fill="both", expand=True, padx=14, pady=(4, 16))
             self.stats_value_labels[key] = value_lbl
 
+        self._move_stats_to_second_screen_if_available()
+
+    def _get_windows_monitors(self):
+        if os.name != "nt":
+            return []
+
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+
+            class RECT(ctypes.Structure):
+                _fields_ = [
+                    ("left", wintypes.LONG),
+                    ("top", wintypes.LONG),
+                    ("right", wintypes.LONG),
+                    ("bottom", wintypes.LONG),
+                ]
+
+            class MONITORINFO(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize", wintypes.DWORD),
+                    ("rcMonitor", RECT),
+                    ("rcWork", RECT),
+                    ("dwFlags", wintypes.DWORD),
+                ]
+
+            monitors = []
+            MONITORINFOF_PRIMARY = 1
+
+            MonitorEnumProc = ctypes.WINFUNCTYPE(
+                wintypes.BOOL,
+                wintypes.HMONITOR,
+                wintypes.HDC,
+                ctypes.POINTER(RECT),
+                wintypes.LPARAM,
+            )
+
+            def _callback(h_monitor, _hdc, _lprc, _lparam):
+                info = MONITORINFO()
+                info.cbSize = ctypes.sizeof(MONITORINFO)
+                if user32.GetMonitorInfoW(h_monitor, ctypes.byref(info)):
+                    monitors.append({
+                        "left": int(info.rcMonitor.left),
+                        "top": int(info.rcMonitor.top),
+                        "right": int(info.rcMonitor.right),
+                        "bottom": int(info.rcMonitor.bottom),
+                        "is_primary": bool(info.dwFlags & MONITORINFOF_PRIMARY),
+                    })
+                return True
+
+            user32.EnumDisplayMonitors(0, 0, MonitorEnumProc(_callback), 0)
+            return monitors
+        except Exception:
+            return []
+
+    def _move_stats_to_second_screen_if_available(self):
+        monitors = self._get_windows_monitors()
+        if len(monitors) < 2:
+            return
+
+        target = next((m for m in monitors if not m.get("is_primary")), monitors[1])
+
+        self.stats_window.update_idletasks()
+        window_width = self.stats_window.winfo_width()
+        window_height = self.stats_window.winfo_height()
+
+        target_width = max(1, target["right"] - target["left"])
+        target_height = max(1, target["bottom"] - target["top"])
+
+        x = target["left"] + max(0, (target_width - window_width) // 2)
+        y = target["top"] + max(0, (target_height - window_height) // 2)
+
+        self.stats_window.geometry(f"{window_width}x{window_height}+{x}+{y}")
+
     def _set_custom_fields_from_preset(self, preset):
         self.players_var.set(str(preset["num_players"]))
         self.minutes_var.set(str(preset["mins"]))
