@@ -317,6 +317,7 @@ class EvilEyeGame(tk.Tk):
 		self.status_var = tk.StringVar(value="Press Start Round")
 		self.round_var = tk.StringVar(value="Round: 0")
 		self.phase_var = tk.StringVar(value="Phase: Idle")
+		self.show_tutorial_var = tk.BooleanVar(value=True)
 
 		self.sequence = []
 		self.input_index = 0
@@ -496,6 +497,12 @@ class EvilEyeGame(tk.Tk):
 		tk.Label(top, textvariable=self._device_label_var, bg="#1f1f1f", fg="#888").pack(side=tk.RIGHT, padx=10)
 		self._mode_btn = ttk.Button(top, text=self._mode_btn_text(), command=self._switch_connection)
 		self._mode_btn.pack(side=tk.RIGHT, padx=6, pady=10)
+		tk.Checkbutton(
+			top,
+			text="Show Tutorial",
+			variable=self.show_tutorial_var,
+			command=self._update_tv_text,
+		).pack(side=tk.RIGHT, padx=8)
 
 		self.log_text = tk.Text(self, height=20, state="disabled", bg="#111", fg="#00ff8c")
 		self.log_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
@@ -525,6 +532,41 @@ class EvilEyeGame(tk.Tk):
 		)
 		self._tv_label.pack(expand=True, fill=tk.BOTH, padx=40, pady=20)
 
+		self._build_tv_tutorial_overlay()
+
+	def _build_tv_tutorial_overlay(self):
+		self._tv_tutorial_frame = tk.Frame(self._tv_window, bg="#0a1018")
+
+		tk.Label(
+			self._tv_tutorial_frame,
+			text="HOW TO PLAY",
+			foreground="#00ff8c",
+			background="#0a1018",
+			font=("Segoe UI", 36, "bold"),
+		).pack(pady=(30, 8))
+
+		instructions = [
+			"Watch the pattern and memorize it.",
+			"GREEN LIGHT: repeat the pattern in order.",
+			"RED LIGHT: freeze, do not press wall buttons.",
+			"Eye motion adds strikes and reduces your time.",
+			"Finish all steps before timeout to pass the round.",
+		]
+
+		for line in instructions:
+			tk.Label(
+				self._tv_tutorial_frame,
+				text=line,
+				foreground="#e8eef6",
+				background="#0a1018",
+				font=("Segoe UI", 20, "bold"),
+				justify="center",
+				anchor="center",
+			).pack(pady=6)
+
+	def _should_show_tutorial(self):
+		return bool(self.show_tutorial_var.get()) and self.phase == "IDLE" and len(self.sequence) == 0
+
 	def _position_tv_window(self):
 		if not self._tv_window:
 			return
@@ -542,6 +584,20 @@ class EvilEyeGame(tk.Tk):
 			pass
 
 	def _update_tv_text(self):
+		if not self._tv_window or not self._tv_window.winfo_exists():
+			return
+
+		tutorial_frame = getattr(self, "_tv_tutorial_frame", None)
+		tutorial_exists = bool(tutorial_frame) and tutorial_frame.winfo_exists()
+
+		if self._should_show_tutorial():
+			if tutorial_exists:
+				tutorial_frame.place(relx=0, rely=0, relwidth=1, relheight=1)
+			return
+
+		if tutorial_exists:
+			tutorial_frame.place_forget()
+
 		phase = self.phase
 		round_no = len(self.sequence)
 
