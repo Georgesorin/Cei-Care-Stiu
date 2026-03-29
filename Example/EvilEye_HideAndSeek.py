@@ -23,14 +23,49 @@ import time
 import tkinter as tk
 import winsound
 
-try:
-    import screeninfo as _screeninfo
-    def _get_monitors():
-        return _screeninfo.get_monitors()
-except ImportError:
-    _screeninfo = None
-    def _get_monitors():
-        return []
+def _get_monitors():
+    """Enumerate monitors via the Windows API – no third-party packages needed."""
+    import ctypes, ctypes.wintypes
+
+    class _Mon:
+        def __init__(self, x, y, w, h, name):
+            self.x, self.y, self.width, self.height, self.name = x, y, w, h, name
+        def __repr__(self):
+            return f"<Monitor {self.name} {self.width}x{self.height} @({self.x},{self.y})>"
+
+    class MONITORINFOEX(ctypes.Structure):
+        _fields_ = [
+            ("cbSize",    ctypes.c_uint32),
+            ("rcMonitor", ctypes.wintypes.RECT),
+            ("rcWork",    ctypes.wintypes.RECT),
+            ("dwFlags",   ctypes.c_uint32),
+            ("szDevice",  ctypes.c_wchar * 32),
+        ]
+
+    MONITORENUMPROC = ctypes.WINFUNCTYPE(
+        ctypes.c_bool,
+        ctypes.c_ulong, ctypes.c_ulong,
+        ctypes.POINTER(ctypes.wintypes.RECT),
+        ctypes.c_long,
+    )
+
+    monitors = []
+
+    def _cb(hMon, _hdc, _lprc, _data):
+        info = MONITORINFOEX()
+        info.cbSize = ctypes.sizeof(MONITORINFOEX)
+        ctypes.windll.user32.GetMonitorInfoW(hMon, ctypes.byref(info))
+        r = info.rcMonitor
+        monitors.append(_Mon(r.left, r.top,
+                             r.right - r.left, r.bottom - r.top,
+                             info.szDevice.strip()))
+        return True
+
+    try:
+        ctypes.windll.user32.EnumDisplayMonitors(None, None, MONITORENUMPROC(_cb), 0)
+    except Exception as exc:
+        print(f"[monitors] EnumDisplayMonitors failed: {exc}")
+    return monitors
 
 # ── Game timing (seconds) ────────────────────────────────────────────────────
 GAME_DURATION   = 120.0  # total game length
@@ -677,29 +712,35 @@ class GameUI:
         # ── position Display window (inside screen) ──────────────────────────
         dm = monitors[DISPLAY_MONITOR] if len(monitors) > DISPLAY_MONITOR else None
         if dm:
+            # Step 1: move the window onto the target monitor (position only)
+            self.root.geometry(f"+{dm.x}+{dm.y}")
+            self.root.update_idletasks()   # flush so Windows knows where the window is
             if DISPLAY_FULLSCREEN:
-                # Move to the right monitor first, then go fullscreen
-                self.root.geometry(f"{dm.width}x{dm.height}+{dm.x}+{dm.y}")
-                self.root.attributes("-fullscreen", True)
+                # Step 2: maximize IN PLACE – 'zoomed' respects the current monitor
+                self.root.state("zoomed")
                 self._fs = True
             else:
                 self.root.geometry(f"{dm.width}x{dm.height}+{dm.x}+{dm.y}")
-        # F11 toggles fullscreen on the display window
+        # F11 toggles maximized/restored on the display window
         self.root.bind("<F11>", self._toggle_fs)
 
         # ── position Control window (outside screen) ─────────────────────────
         cm = monitors[CONTROL_MONITOR] if len(monitors) > CONTROL_MONITOR else None
         if cm:
-            # Centre the control window on its monitor
             cw, ch = 420, 180
             cx = cm.x + (cm.width  - cw) // 2
             cy = cm.y + (cm.height - ch) // 2
             self.control.win.geometry(f"{cw}x{ch}+{cx}+{cy}")
-        self.control.win.lift()            # bring to front after positioning
+            self.control.win.update_idletasks()
+        self.control.win.lift()
 
     def _toggle_fs(self, _event=None):
-        self._fs = not self._fs
-        self.root.attributes("-fullscreen", self._fs)
+        if self.root.state() == "zoomed":
+            self.root.state("normal")
+            self._fs = False
+        else:
+            self.root.state("zoomed")
+            self._fs = True
 
     def run(self):
         self.root.mainloop()
