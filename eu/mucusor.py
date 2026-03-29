@@ -3025,12 +3025,44 @@ class GameControlUI:
         x = target["left"]
         y = target["top"]
 
-        # First move/size to the target monitor, then request fullscreen.
-        # On Windows this keeps fullscreen scoped to the selected monitor.
+        # Force placement on the target monitor, then maximize there.
+        # Tk fullscreen may jump back to the primary monitor on Windows.
         self.stats_window.attributes("-fullscreen", False)
+        self.stats_window.state("normal")
         self.stats_window.geometry(f"{target_width}x{target_height}+{x}+{y}")
         self.stats_window.update_idletasks()
-        self.stats_window.attributes("-fullscreen", True)
+
+        if os.name == "nt":
+            try:
+                import ctypes
+
+                hwnd = self.stats_window.winfo_id()
+                user32 = ctypes.windll.user32
+
+                SW_MAXIMIZE = 3
+                SWP_NOZORDER = 0x0004
+                SWP_NOACTIVATE = 0x0010
+                SWP_SHOWWINDOW = 0x0040
+
+                user32.SetWindowPos(
+                    hwnd,
+                    0,
+                    int(x),
+                    int(y),
+                    int(target_width),
+                    int(target_height),
+                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                )
+                user32.ShowWindow(hwnd, SW_MAXIMIZE)
+                return
+            except Exception:
+                pass
+
+        # Non-Windows fallback.
+        try:
+            self.stats_window.state("zoomed")
+        except Exception:
+            pass
 
     def _set_custom_fields_from_preset(self, preset):
         self.players_var.set(str(preset["num_players"]))
