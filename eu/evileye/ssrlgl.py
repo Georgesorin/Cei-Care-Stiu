@@ -29,7 +29,7 @@ DEVICE_SEND_PORT = 4626            # Send light commands to device
 DEVICE_RECV_PORT = 7800            # Receive button events from device
 DISCOVERY_TIMEOUT_SEC = 3  # How long to wait for a hardware response
 SIMULATOR_COLOR_ORDER = 'RGB'
-LIVE_COLOR_ORDER = 'GRB'
+LIVE_COLOR_ORDER = 'BGR'
 
 # Playable buttons based on your wall layout (buttons 1-10, excluding the eye).
 WALL_PATH = [idx for idx in range(LEDS_PER_CHANNEL) if idx != EYE_LED_INDEX]
@@ -42,17 +42,17 @@ INPUT_RED_MS = 1400
 INPUT_TIMEOUT_MS = 20000
 LED_REFRESH_MS = 220
 START_ROUND_DELAY_MS = 3000
-EYE_PENALTY_SECONDS = 1.0
-MAX_EYE_STRIKES = 4
+EYE_PENALTY_SECONDS = 0.5
+MAX_EYE_STRIKES = 6
 AUTO_NEXT_ROUND_MS = 5000
 RED_PENALTY_RESTART_MS = 2000
 DETECTION_COOLDOWN_MS = 180
-MOTION_COOLDOWN_MS = 900
+MOTION_COOLDOWN_MS = 2000
 RED_LIGHT_GRACE_MS = 350
 RED_MOVE_COOLDOWN_MS = 1400
 MAX_ROUND1_REGRESSIONS = 5
-MOTION_CONFIRM_PACKETS = 1
-MOTION_ACTIVE_GAP_MS = 180
+MOTION_CONFIRM_PACKETS = 3
+MOTION_ACTIVE_GAP_MS = 500
 
 PASSWORD_ARRAY = [
 	35, 63, 187, 69, 107, 178, 92, 76, 39, 69, 205, 37, 223, 255, 165, 231,
@@ -722,7 +722,7 @@ class EvilEyeGame(tk.Tk):
 
 	def _pick_next_sequence_node(self):
 		if not self.sequence:
-			return (random.randint(1, NUM_CHANNELS), random.choice(WALL_PATH))
+			return (1, random.choice(WALL_PATH))
 
 		prev_node = self.sequence[-1]
 		candidates = []
