@@ -39,6 +39,7 @@ MOTION_COOLDOWN_MS = 900
 RED_LIGHT_GRACE_MS = 350
 RED_MOVE_COOLDOWN_MS = 1400
 MAX_ROUND1_REGRESSIONS = 5
+MOTION_HOLD_MS = 220
 
 PASSWORD_ARRAY = [
 	35, 63, 187, 69, 107, 178, 92, 76, 39, 69, 205, 37, 223, 255, 165, 231,
@@ -275,6 +276,8 @@ class EvilEyeGame(tk.Tk):
 		self._last_light_toggle_ts = 0.0
 		self._last_red_penalty_ts = 0.0
 		self.red_warning_used = False
+		self._motion_started_at = {}
+		self._motion_reported_active = set()
 
 		self._last_led_states = {}
 		self._flash_leds = {}
@@ -325,6 +328,8 @@ class EvilEyeGame(tk.Tk):
 		self._last_light_toggle_ts = 0.0
 		self._last_red_penalty_ts = 0.0
 		self.red_warning_used = False
+		self._motion_started_at.clear()
+		self._motion_reported_active.clear()
 		self.prev_pressed.clear()
 		self._flash_leds.clear()
 		self.round_var.set("Round: 0")
@@ -677,7 +682,24 @@ class EvilEyeGame(tk.Tk):
 				if data[base + 1 + idx] == 0xCC:
 					pressed.add((ch, idx))
 
-		rising = pressed - self.prev_pressed
+		now = time.time()
+
+		# Motion (LED index 0) is noisy; require a short sustained hold to count.
+		for ch in range(1, NUM_CHANNELS + 1):
+			node = (ch, 0)
+			if node in pressed:
+				if ch not in self._motion_started_at:
+					self._motion_started_at[ch] = now
+				elif ch not in self._motion_reported_active:
+					if (now - self._motion_started_at[ch]) >= (MOTION_HOLD_MS / 1000.0):
+						self._motion_reported_active.add(ch)
+						self._handle_rising_press(ch, 0)
+			else:
+				self._motion_started_at.pop(ch, None)
+				self._motion_reported_active.discard(ch)
+
+		# Regular wall buttons still use rising-edge detection.
+		rising = {(ch, led) for (ch, led) in (pressed - self.prev_pressed) if led != 0}
 		self.prev_pressed = pressed
 
 		for ch, led in sorted(rising):
