@@ -1814,84 +1814,7 @@ if __name__ == "__main__":
 
         return sa_var, sb_var, t_var, t_lbl
 
-    # ── Monitor picker dialog ─────────────────────────────────────────────────
-    def launch_ui_after_pick(monitors):
-        """
-        Show a small dialog so the user picks which monitor gets
-        the Control panel and which gets the Scoreboard.
-        Called with a list of screeninfo Monitor objects (may be empty).
-        """
-        picker = tk.Tk()
-        picker.title("Battle Blaster — Monitor Setup")
-        picker.configure(bg=BG)
-        picker.resizable(False, False)
-
-        tk.Label(picker, text="⚡ MONITOR SETUP", bg=BG,
-                 fg=WHITE_HEX, font=("Consolas", 14, "bold")).pack(pady=(16, 4))
-
-        # Show detected monitors and let user label them
-        monitor_entries = []
-        if monitors:
-            tk.Label(picker, text="Label each monitor (e.g. 1, 2, A, B …)",
-                     bg=BG, fg=DIM_HEX, font=("Consolas", 9)).pack(pady=(0, 6))
-            for i, m in enumerate(monitors):
-                name = getattr(m, 'name', f'Monitor {i}')
-                row  = tk.Frame(picker, bg=BG)
-                row.pack(fill="x", padx=20, pady=2)
-                tk.Label(row, text=f"{name}  ({m.width}×{m.height})",
-                         bg=BG, fg=WHITE_HEX,
-                         font=("Consolas", 9), width=28, anchor="w").pack(side="left")
-                e = tk.Entry(row, width=6, bg=BTN_BG, fg=WHITE_HEX,
-                             insertbackground=WHITE_HEX, relief="flat",
-                             font=("Consolas", 10))
-                e.pack(side="left", padx=6)
-                monitor_entries.append((m, e))
-        else:
-            tk.Label(picker,
-                     text="screeninfo not available.\nWindows will open on the primary monitor.",
-                     bg=BG, fg=DIM_HEX, font=("Consolas", 9)).pack(pady=6, padx=20)
-
-        sep = tk.Frame(picker, bg=DIM_HEX, height=1)
-        sep.pack(fill="x", padx=16, pady=10)
-
-        tk.Label(picker, text="Control panel → monitor label:",
-                 bg=BG, fg=WHITE_HEX, font=("Consolas", 10)).pack(anchor="w", padx=20)
-        ctrl_entry = tk.Entry(picker, width=8, bg=BTN_BG, fg=WHITE_HEX,
-                              insertbackground=WHITE_HEX, relief="flat",
-                              font=("Consolas", 11))
-        ctrl_entry.pack(anchor="w", padx=20, pady=(2, 8))
-
-        tk.Label(picker, text="Scoreboard → monitor label:",
-                 bg=BG, fg=WHITE_HEX, font=("Consolas", 10)).pack(anchor="w", padx=20)
-        board_entry = tk.Entry(picker, width=8, bg=BTN_BG, fg=WHITE_HEX,
-                               insertbackground=WHITE_HEX, relief="flat",
-                               font=("Consolas", 11))
-        board_entry.pack(anchor="w", padx=20, pady=(2, 12))
-
-        def find_monitor(label):
-            label = label.strip()
-            if not label:
-                return None
-            for m, e in monitor_entries:
-                if e.get().strip() == label:
-                    return m
-            return None
-
-        def on_start():
-            ctrl_mon  = find_monitor(ctrl_entry.get())
-            board_mon = find_monitor(board_entry.get())
-            picker.destroy()
-            open_main_windows(ctrl_mon, board_mon)
-
-        tk.Button(picker, text="▶  LAUNCH", command=on_start,
-                  bg="#1a3a1a", fg="#44ff88", activebackground="#2a5a2a",
-                  activeforeground="#44ff88", relief="flat",
-                  font=("Consolas", 12, "bold"), pady=8, cursor="hand2").pack(
-                      fill="x", padx=20, pady=(0, 16))
-
-        picker.mainloop()
-
-    # ── Actually open the two windows ─────────────────────────────────────────
+    # ── Open the two windows ──────────────────────────────────────────────────
     def open_main_windows(ctrl_mon, board_mon):
         root = tk.Tk()
 
@@ -1943,12 +1866,31 @@ if __name__ == "__main__":
         refresh()
         root.mainloop()
 
-    # ── Entry: detect monitors then show picker ────────────────────────────────
-    monitors = []
+    # ── Auto-detect monitors and launch directly ──────────────────────────────
+    ctrl_mon  = None
+    board_mon = None
+
     if SCREENINFO_OK:
         try:
             monitors = screeninfo.get_monitors()
-        except Exception:
-            monitors = []
+            if len(monitors) >= 2:
+                # Primary monitor → control panel
+                ctrl_mon = next(
+                    (m for m in monitors if getattr(m, 'is_primary', False)),
+                    monitors[0]
+                )
+                # First non-primary → scoreboard fullscreen
+                board_mon = next(
+                    (m for m in monitors if m is not ctrl_mon),
+                    None
+                )
+                print(f"Control panel  → {getattr(ctrl_mon,  'name', '?')} "
+                      f"({ctrl_mon.width}x{ctrl_mon.height})")
+                print(f"Scoreboard     → {getattr(board_mon, 'name', '?')} "
+                      f"({board_mon.width}x{board_mon.height})")
+            else:
+                print("Only one monitor detected — both windows on primary screen.")
+        except Exception as e:
+            print(f"Monitor detection failed ({e}) — single screen fallback.")
 
-    launch_ui_after_pick(monitors)
+    open_main_windows(ctrl_mon, board_mon)
