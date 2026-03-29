@@ -2,6 +2,7 @@ import socket
 import threading
 import random
 import time
+import ctypes
 import tkinter as tk
 from tkinter import ttk
 
@@ -10,15 +11,20 @@ NUM_CHANNELS = 4
 LEDS_PER_CHANNEL = 11
 EYE_LED_INDEX = 10
 SIMULATOR_IP = '127.0.0.1'
-SEND_PORT = 4626  # To simulator (light commands)
-RECV_PORT = 7800  # From simulator (button events)
+# SEND_PORT = 4626  # To simulator (light commands)
+# RECV_PORT = 7800  # From simulator (button events)
+SEND_PORT = 7273
+RECV_PORT = 7272
 FRAME_DATA_LEN = LEDS_PER_CHANNEL * NUM_CHANNELS * 3
 TRIGGER_PACKET_LEN = 687
 
 # Real hardware ports (used when a device is discovered on the LAN)
-DEVICE_IP = '169.254.182.11'  # Known device IP (link-local)
-DEVICE_SEND_PORT = 4626    # Send light commands to device
-DEVICE_RECV_PORT = 7800    # Receive button events from device
+# DEVICE_IP = '169.254.182.11'  Known device IP (link-local)
+DEVICE_IP = '127.0.0.1'
+# DEVICE_SEND_PORT = 4626    # Send light commands to device
+# DEVICE_RECV_PORT = 7800    # Receive button events from device
+DEVICE_SEND_PORT = 7273
+DEVICE_RECV_PORT = 7272
 DISCOVERY_TIMEOUT_SEC = 3  # How long to wait for a hardware response
 
 # Playable buttons based on your wall layout (all non-eye LEDs).
@@ -27,13 +33,13 @@ WALL_PATH = [idx for idx in range(LEDS_PER_CHANNEL) if idx != EYE_LED_INDEX]
 # Timings (milliseconds)
 SHOW_ON_MS = 700
 SHOW_OFF_MS = 250
-INPUT_GREEN_MS = 2300
+INPUT_GREEN_MS = 3400
 INPUT_RED_MS = 1400
 INPUT_TIMEOUT_MS = 20000
 LED_REFRESH_MS = 220
 EYE_PENALTY_SECONDS = 1.0
 MAX_EYE_STRIKES = 4
-AUTO_NEXT_ROUND_MS = 10000
+AUTO_NEXT_ROUND_MS = 5000
 RED_PENALTY_RESTART_MS = 2000
 DETECTION_COOLDOWN_MS = 180
 MOTION_COOLDOWN_MS = 900
@@ -211,6 +217,39 @@ def run_discovery():
 	return DEVICE_IP, DEVICE_SEND_PORT, DEVICE_RECV_PORT
 
 
+def get_monitor_rects():
+	"""Return monitor rectangles [(left, top, right, bottom), ...] on Windows."""
+	class RECT(ctypes.Structure):
+		_fields_ = [
+			("left", ctypes.c_long),
+			("top", ctypes.c_long),
+			("right", ctypes.c_long),
+			("bottom", ctypes.c_long),
+		]
+
+	monitor_rects = []
+
+	MONITORENUMPROC = ctypes.WINFUNCTYPE(
+		ctypes.c_int,
+		ctypes.c_ulong,
+		ctypes.c_ulong,
+		ctypes.POINTER(RECT),
+		ctypes.c_double,
+	)
+
+	def _callback(hmonitor, hdc, lprect, lparam):
+		r = lprect.contents
+		monitor_rects.append((int(r.left), int(r.top), int(r.right), int(r.bottom)))
+		return 1
+
+	try:
+		ctypes.windll.user32.EnumDisplayMonitors(0, 0, MONITORENUMPROC(_callback), 0)
+	except Exception:
+		return []
+
+	return monitor_rects
+
+
 # --- UDP Communication ---
 class EvilEyeComm:
 	def __init__(self, recv_callback, device_ip, send_port, recv_port):
@@ -290,8 +329,16 @@ class EvilEyeGame(tk.Tk):
 		self._timeout_job = None
 		self._refresh_job = None
 		self._next_round_job = None
+		self._tv_window = None
+		self._tv_text_var = tk.StringVar(value="Welcome. Press Start Round.")
 
 		self._build_ui()
+		self._build_tv_ui()
+		self._position_tv_window()
+		self._update_tv_text()
+		self.status_var.trace_add("write", lambda *_args: self._update_tv_text())
+		self.phase_var.trace_add("write", lambda *_args: self._update_tv_text())
+		self.round_var.trace_add("write", lambda *_args: self._update_tv_text())
 		self._schedule_led_refresh()
 		self.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -308,6 +355,69 @@ class EvilEyeGame(tk.Tk):
 
 		self.log_text = tk.Text(self, height=20, state="disabled", bg="#111", fg="#00ff8c")
 		self.log_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+
+	def _build_tv_ui(self):
+		self._tv_window = tk.Toplevel(self)
+		self._tv_window.title("Evil Eye - Room Display")
+		self._tv_window.configure(bg="#050505")
+
+		header = tk.Label(
+			self._tv_window,
+			text="EVIL EYE",
+			bg="#050505",
+			fg="#00ff8c",
+			font=("Segoe UI", 34, "bold"),
+		)
+		header.pack(pady=(24, 8))
+
+		self._tv_label = tk.Label(
+			self._tv_window,
+			textvariable=self._tv_text_var,
+			bg="#050505",
+			fg="#f0f0f0",
+			font=("Segoe UI", 28, "bold"),
+			justify="center",
+			wraplength=1400,
+		)
+		self._tv_label.pack(expand=True, fill=tk.BOTH, padx=40, pady=20)
+
+	def _position_tv_window(self):
+		if not self._tv_window:
+			return
+
+		# Default behavior: leave it as a normal window if second monitor is unavailable.
+		try:
+			monitors = get_monitor_rects()
+			if len(monitors) >= 2:
+				left, top, right, bottom = monitors[1]
+				width = max(1, right - left)
+				height = max(1, bottom - top)
+				self._tv_window.geometry(f"{width}x{height}+{left}+{top}")
+				self._tv_window.state("zoomed")
+		except Exception:
+			pass
+
+	def _update_tv_text(self):
+		phase = self.phase
+		round_no = len(self.sequence)
+
+		if phase == "IDLE":
+			msg = "Press START ROUND"
+		elif phase == "SHOW":
+			msg = "Watch carefully\nMemorize the sequence"
+		elif phase == "INPUT":
+			if self.green_light:
+				msg = "GREEN LIGHT\nRepeat the sequence now"
+			else:
+				msg = "RED LIGHT\nFreeze - no movement"
+		elif phase == "GAME_OVER":
+			msg = "GAME OVER\nAsk staff to reset"
+		else:
+			msg = self.status_var.get()
+
+		line2 = f"Round {round_no}"
+		line3 = f"Strikes: {self.eye_strikes}/{MAX_EYE_STRIKES}"
+		self._tv_text_var.set(f"{msg}\n\n{line2}\n{line3}")
 
 	def _btn_label(self, led):
 		return led + 1
@@ -542,8 +652,8 @@ class EvilEyeGame(tk.Tk):
 		return max(300, SHOW_ON_MS - (len(self.sequence) - 1) * 40)
 
 	def _get_input_green_ms(self):
-		"""Green-light window shrinks from 2300ms → 1100ms over 10 rounds."""
-		return max(1100, INPUT_GREEN_MS - (len(self.sequence) - 1) * 120)
+		"""Green-light window shrinks from 3400ms → 1800ms over rounds."""
+		return max(1800, INPUT_GREEN_MS - (len(self.sequence) - 1) * 85)
 
 	def _get_input_red_ms(self):
 		"""Red-light freeze grows from 1400ms → 2400ms over 10 rounds."""
@@ -719,6 +829,11 @@ class EvilEyeGame(tk.Tk):
 	def on_close(self):
 		self._cancel_jobs()
 		self.comm.close()
+		if self._tv_window is not None:
+			try:
+				self._tv_window.destroy()
+			except Exception:
+				pass
 		self.destroy()
 
 if __name__ == "__main__":
