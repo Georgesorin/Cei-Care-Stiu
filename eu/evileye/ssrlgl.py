@@ -30,10 +30,15 @@ INPUT_GREEN_MS = 2300
 INPUT_RED_MS = 1400
 INPUT_TIMEOUT_MS = 20000
 LED_REFRESH_MS = 220
-EYE_PENALTY_SECONDS = 2.5
-MAX_EYE_STRIKES = 2
+EYE_PENALTY_SECONDS = 1.0
+MAX_EYE_STRIKES = 4
 AUTO_NEXT_ROUND_MS = 10000
 RED_PENALTY_RESTART_MS = 2000
+DETECTION_COOLDOWN_MS = 180
+MOTION_COOLDOWN_MS = 900
+RED_LIGHT_GRACE_MS = 350
+RED_MOVE_COOLDOWN_MS = 1400
+MAX_ROUND1_REGRESSIONS = 5
 
 PASSWORD_ARRAY = [
 	35, 63, 187, 69, 107, 178, 92, 76, 39, 69, 205, 37, 223, 255, 165, 231,
@@ -265,6 +270,11 @@ class EvilEyeGame(tk.Tk):
 		self.eye_strikes = 0
 		self.round1_grace_available = True
 		self.round1_regression_count = 0
+		self._last_press_ts = 0.0
+		self._last_motion_ts = 0.0
+		self._last_light_toggle_ts = 0.0
+		self._last_red_penalty_ts = 0.0
+		self.red_warning_used = False
 
 		self._last_led_states = {}
 		self._flash_leds = {}
@@ -310,6 +320,11 @@ class EvilEyeGame(tk.Tk):
 		self.eye_strikes = 0
 		self.round1_grace_available = True
 		self.round1_regression_count = 0
+		self._last_press_ts = 0.0
+		self._last_motion_ts = 0.0
+		self._last_light_toggle_ts = 0.0
+		self._last_red_penalty_ts = 0.0
+		self.red_warning_used = False
 		self.prev_pressed.clear()
 		self._flash_leds.clear()
 		self.round_var.set("Round: 0")
@@ -374,6 +389,8 @@ class EvilEyeGame(tk.Tk):
 		self.green_light = True
 		self.input_deadline_ts = time.time() + (self._get_input_timeout_ms() / 1000.0)
 		self.eye_strikes = 0
+		self._last_light_toggle_ts = time.time()
+		self.red_warning_used = False
 		self.phase_var.set("Phase: Input")
 		self.status_var.set("Green light: enter sequence | Motion strikes: 0")
 		self.log("Input phase started.")
@@ -392,6 +409,7 @@ class EvilEyeGame(tk.Tk):
 		else:
 			self.status_var.set(f"Red light: freeze | Motion strikes: {self.eye_strikes}/{MAX_EYE_STRIKES}")
 			delay = self._get_input_red_ms()
+		self._last_light_toggle_ts = time.time()
 
 		self._render_leds()
 		self._light_job = self.after(delay, self._schedule_light_toggle)
@@ -449,7 +467,7 @@ class EvilEyeGame(tk.Tk):
 			self.sequence.pop()
 		if regressing_to_round1:
 			self.round1_regression_count += 1
-			if self.round1_regression_count >= 3:
+			if self.round1_regression_count >= MAX_ROUND1_REGRESSIONS:
 				self._trigger_game_over()
 				return
 		self.phase = "ROUND_OVER"
@@ -584,11 +602,37 @@ class EvilEyeGame(tk.Tk):
 		if self.phase != "INPUT":
 			return
 
+		now = time.time()
+		if (now - self._last_press_ts) < (DETECTION_COOLDOWN_MS / 1000.0):
+			return
+
 		if led == 0:
+			if (now - self._last_motion_ts) < (MOTION_COOLDOWN_MS / 1000.0):
+				return
+			self._last_motion_ts = now
+			self._last_press_ts = now
 			self._apply_motion_penalty(channel)
 			return
 
 		if not self.green_light:
+			if (now - self._last_light_toggle_ts) < (RED_LIGHT_GRACE_MS / 1000.0):
+				self.log(f"Ignored W{channel} B{led} during red-light grace window")
+				return
+			if not self.red_warning_used:
+				self.red_warning_used = True
+				self._last_press_ts = now
+				self._flash((channel, led), (255, 0, 0), 0.6)
+				self.status_var.set(
+					f"Warning: moved on RED once (next red move penalizes) | Motion strikes: {self.eye_strikes}/{MAX_EYE_STRIKES}"
+				)
+				self.log(f"Warning only: RED movement at W{channel} B{led}")
+				self._render_leds()
+				return
+			if (now - self._last_red_penalty_ts) < (RED_MOVE_COOLDOWN_MS / 1000.0):
+				self.log(f"Ignored repeated RED movement at W{channel} B{led} (cooldown)")
+				return
+			self._last_red_penalty_ts = now
+			self._last_press_ts = now
 			self._apply_red_move_penalty(channel, led)
 			return
 
@@ -598,11 +642,13 @@ class EvilEyeGame(tk.Tk):
 
 		expected = self.sequence[self.input_index]
 		if (channel, led) != expected:
+			self._last_press_ts = now
 			self._flash((channel, led), (255, 0, 0), 0.6)
 			self._render_leds()
 			self._round_failed(f"Wrong button. Expected W{expected[0]} B{expected[1]}")
 			return
 
+		self._last_press_ts = now
 		self._flash((channel, led), (0, 255, 120), 0.5)
 		self.log(f"Correct: W{channel} B{led}")
 		self.input_index += 1
