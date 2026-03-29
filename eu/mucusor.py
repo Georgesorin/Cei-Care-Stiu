@@ -3009,22 +3009,28 @@ class GameControlUI:
 
     def _move_stats_to_second_screen_if_available(self):
         monitors = self._get_windows_monitors()
-        if len(monitors) < 2:
-            return
-
-        target = next((m for m in monitors if not m.get("is_primary")), monitors[1])
-
         self.stats_window.update_idletasks()
-        window_width = self.stats_window.winfo_width()
-        window_height = self.stats_window.winfo_height()
+
+        if len(monitors) >= 2:
+            target = next((m for m in monitors if not m.get("is_primary")), monitors[1])
+        elif monitors:
+            target = monitors[0]
+        else:
+            # Fallback when monitor enumeration fails: use current fullscreen behavior.
+            self.stats_window.attributes("-fullscreen", True)
+            return
 
         target_width = max(1, target["right"] - target["left"])
         target_height = max(1, target["bottom"] - target["top"])
+        x = target["left"]
+        y = target["top"]
 
-        x = target["left"] + max(0, (target_width - window_width) // 2)
-        y = target["top"] + max(0, (target_height - window_height) // 2)
-
-        self.stats_window.geometry(f"{window_width}x{window_height}+{x}+{y}")
+        # First move/size to the target monitor, then request fullscreen.
+        # On Windows this keeps fullscreen scoped to the selected monitor.
+        self.stats_window.attributes("-fullscreen", False)
+        self.stats_window.geometry(f"{target_width}x{target_height}+{x}+{y}")
+        self.stats_window.update_idletasks()
+        self.stats_window.attributes("-fullscreen", True)
 
     def _set_custom_fields_from_preset(self, preset):
         self.players_var.set(str(preset["num_players"]))
