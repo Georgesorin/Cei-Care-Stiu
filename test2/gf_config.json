@@ -1,0 +1,25 @@
+{
+  "simulator_mode": true,
+  "simulator_ip": "127.0.0.1",
+  "send_port": 7273,
+  "recv_port": 7271,
+  "device_send_port": 4626,
+  "device_recv_port": 7800,
+  "round_seconds": 180,
+  "police_closed_seconds": 4.0,
+  "police_open_seconds": 2.2,
+  "spin_cost": 10,
+  "starting_money": 100,
+  "move_penalty": 12,
+  "eye_tap_penalty": 18,
+  "refresh_ms": 200,
+  "spin_reveal_step_seconds": 0.12,
+  "enchant_luck_boost": 0.35,
+  "enchant_payout_multiplier": 2.0,
+  "payouts": {
+    "0-2-4": 45,
+    "1-2-3": 35,
+    "0-1-2": 30,
+    "0-1-2-3-4": 180
+  }
+}
