@@ -54,6 +54,12 @@ cand serpii se intalnesc, isi schimba pozitia intre ei
 ca sa dai score la puncte trebuie sa faci o trecere intreaga de perete al echipei
 trebuie trecut prin peretele inamic
 
+steal and hide
+
+apar pe 2 pereti la intamplare cate 1 cub verde pus la intamplare, ai 10 secunde sa le apesi pe amndoua.
+dupa acest timp, toate ledurile de pe un perete se vor face rosii si vei avea 3 secunde sa te ascunzi de evil eye.
+vei sta ascuns 5 secunde, dupa toate ledurile din camera vor da flash alb si jocul o va lua de la capat.
+fiecare buton verde apasat ve fi 1 punct, fiecare buton verde ratat va fi minus 1 punct, de fiecare data cand te prinde ochiul va fi minus 1 punct.
 
 
 
