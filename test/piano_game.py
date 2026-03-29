@@ -241,6 +241,8 @@ def _load_config():
 
 CONFIG = _load_config()
 
+SCORE_WINDOW_PROCESS = None
+
 # --- Networking Constants ---
 UDP_SEND_IP = CONFIG.get("device_ip", "255.255.255.255")
 UDP_SEND_PORT = CONFIG.get("send_port", 7274)
@@ -319,6 +321,8 @@ class PianoController:
         self.sound_threads = []
         self._button_to_note_index = {}
         self._button_side_map = {}
+        self.enable_left = True
+        self.enable_right = True
         self.active_hold_channels = {}
         self.active_hold_started_at = {}
         self.sustain_sound_cache = {}
@@ -336,7 +340,7 @@ class PianoController:
             self.sample_bank = None
         
         # Build piano keyboard mapping on both sides.
-        self._build_piano_column_mapping(left_enabled=True, right_enabled=True)
+        self._build_piano_column_mapping()
         
         if PYGAME_AVAILABLE:
             try:
@@ -349,7 +353,7 @@ class PianoController:
         else:
             self.mixer_available = False
 
-    def _build_piano_column_mapping(self, left_enabled=True, right_enabled=True):
+    def _build_piano_column_mapping(self):
         """
         Build mapping for vertical piano keyboard columns on both sides.
         Border columns (0-1 left, 14-15 right) are visual only.
@@ -358,8 +362,9 @@ class PianoController:
         """
         self._button_to_note_index = {}
         self._button_side_map = {}
-        left_columns_x = [2] if left_enabled else []
-        right_columns_x = [BOARD_WIDTH - 3] if right_enabled else []
+
+        left_columns_x = [2] if self.enable_left else []
+        right_columns_x = [BOARD_WIDTH - 3] if self.enable_right else []
         note_count = min(len(self.note_frequencies), BOARD_HEIGHT)
 
         for note_idx in range(note_count):
@@ -376,9 +381,20 @@ class PianoController:
                 self._button_to_note_index[right_button_idx] = note_idx
                 self._button_side_map[right_button_idx] = "right"
 
-    def set_active_sides(self, left_enabled=True, right_enabled=True):
-        """Limit playable piano columns to active team side(s)."""
-        self._build_piano_column_mapping(left_enabled=left_enabled, right_enabled=right_enabled)
+    def configure_active_sides(self, enable_left=True, enable_right=True):
+        """Enable piano input columns by side and rebuild touch mapping."""
+        if not enable_left and not enable_right:
+            enable_left = True
+            enable_right = True
+
+        self.enable_left = enable_left
+        self.enable_right = enable_right
+
+        # Stop sustained notes when remapping sides.
+        for held_button in list(self.active_hold_channels.keys()):
+            self._stop_held_note(held_button)
+
+        self._build_piano_column_mapping()
 
         
 
@@ -713,11 +729,9 @@ class PianoController:
 
             if is_pressed and not was_pressed:
                 if note_idx < len(self.note_frequencies):
-                    # Stop any other button already playing the same note
-                    for other_button_idx in list(self.active_hold_channels.keys()):
-                        other_note_idx = self._button_to_note_index.get(other_button_idx)
-                        if other_note_idx == note_idx:
-                            self._stop_held_note(other_button_idx)
+                    # Keep opposite-side holds alive; only release older holds
+                    # on the same side to avoid accidental cut-offs on side switch.
+                    self._release_other_holds_on_same_side(button_idx)
                     
                     freq = self.note_frequencies[note_idx]
                     self._start_held_note(button_idx, note_idx, freq)
@@ -776,6 +790,9 @@ class MidiSongPlayer:
         self.midi_path = midi_path
         self.difficulty = difficulty  # 'easy', 'medium', 'hard'
         self.tempo_scale = self.HARD_TEMPO_SCALE if difficulty == 'hard' else 1.0
+        self.enable_left = True
+        self.enable_right = True
+        self.single_target_side = None
         self.all_notes = []      # immutable source notes for replay
         self.flying_notes = []   # active on-screen note blocks
         self.pending_notes = []  # notes waiting to be spawned, sorted by spawn_time
@@ -785,13 +802,8 @@ class MidiSongPlayer:
         self.finished = False
         self._current_elapsed = 0.0
         self._update_counter = 0
-        self.single_side = None  # None, 'left', or 'right'
         self._load_midi(midi_path)
         self._reset_song_state()
-
-    def set_single_side(self, side):
-        """Force all notes to one team side (used when only one team has players)."""
-        self.single_side = side if side in ('left', 'right') else None
 
     def _reset_song_state(self):
         """Reset runtime song state so the same MIDI can be played again."""
@@ -802,13 +814,23 @@ class MidiSongPlayer:
         self.song_started = False
         self._current_elapsed = 0.0
         self._update_counter = 0
-        if self.single_side == 'left':
-            self._going_right = False
-        elif self.single_side == 'right':
-            self._going_right = True
-        else:
-            self._going_right = True
+        self._going_right = True          # current travel direction
         self._next_interval_at = self.DIRECTION_INTERVAL  # elapsed time of next change
+
+    def configure_active_sides(self, enable_left=True, enable_right=True):
+        """Restrict note targets to active piano side when only one side has players."""
+        if not enable_left and not enable_right:
+            enable_left = True
+            enable_right = True
+
+        self.enable_left = enable_left
+        self.enable_right = enable_right
+        if enable_left and not enable_right:
+            self.single_target_side = 'left'
+        elif enable_right and not enable_left:
+            self.single_target_side = 'right'
+        else:
+            self.single_target_side = None
 
     def _load_midi(self, path):
         try:
@@ -834,14 +856,27 @@ class MidiSongPlayer:
 
         events = []
         abs_time = 0.0
+        active_notes = {}
         for msg in mid:               # mido yields messages with time in seconds
             abs_time += msg.time
+
             if msg.type == 'note_on' and msg.velocity > 0:
-                events.append((abs_time, msg.note))
+                active_notes.setdefault(msg.note, []).append(abs_time)
+            elif msg.type == 'note_off' or (msg.type == 'note_on' and msg.velocity == 0):
+                starts = active_notes.get(msg.note)
+                if starts:
+                    start_time = starts.pop(0)
+                    hold_seconds = max(0.0, abs_time - start_time)
+                    events.append((start_time, msg.note, hold_seconds))
+
+        # Fallback for notes that never got an explicit note_off.
+        for midi_note, starts in active_notes.items():
+            for start_time in starts:
+                events.append((start_time, midi_note, 0.25))
 
         parsed_notes = []
         note_index = 0  # For hard mode: alternate sides per note
-        for play_time, midi_note in events:
+        for play_time, midi_note, hold_seconds in events:
             scaled_play_time = play_time * self.tempo_scale
             # Shift out-of-range notes into piano range (C3–G5, MIDI 48–79) by octave
             midi_note = _mutate_midi_note(midi_note)
@@ -852,6 +887,7 @@ class MidiSongPlayer:
                 'play_time':  scaled_play_time,
                 'note_idx':   note_idx,
                 'row':        row,
+                'hold_seconds': max(0.0, hold_seconds * self.tempo_scale),
             }
             # For hard mode, force alternating sides
             if self.difficulty == 'hard':
@@ -893,8 +929,8 @@ class MidiSongPlayer:
             self.spawn_queue.append(self.pending_notes.pop(0))
             queued_this_frame += 1
 
-        # Check 10-second interval: toggle direction.
-        if self.single_side is None and elapsed >= self._next_interval_at:
+        # Toggle direction only in two-sided mode.
+        if self.single_target_side is None and elapsed >= self._next_interval_at:
             self._going_right = not self._going_right
             self._next_interval_at += self.DIRECTION_INTERVAL
 
@@ -904,23 +940,23 @@ class MidiSongPlayer:
             n = self.spawn_queue.pop(0)
             spawned_this_frame += 1
             budget -= 1
-            # In single-side mode, always send notes toward that side.
-            if self.single_side == 'left':
+            # In one-sided mode, always travel toward the active piano side from the opposite end.
+            if self.single_target_side == 'left':
                 going_right = False
-            elif self.single_side == 'right':
+            elif self.single_target_side == 'right':
                 going_right = True
             else:
                 # Use forced_side if present (hard mode), otherwise current direction.
                 going_right = n.get('forced_side', 'right' if self._going_right else 'left') == 'right'
             # Pick side, direction, and color set
             if going_right:
-                spawn_x   = self.MIDDLE_COL_RIGHT
+                spawn_x   = self.MIDDLE_COL_RIGHT if self.single_target_side is None else self.TARGET_COL_LEFT
                 target_x  = self.TARGET_COL_RIGHT
                 dx        = self.MOVE_SPEED
                 color_natural = self.COLOR_NATURAL_RIGHT
                 color_sharp   = self.COLOR_SHARP_RIGHT
             else:
-                spawn_x   = self.MIDDLE_COL_LEFT
+                spawn_x   = self.MIDDLE_COL_LEFT if self.single_target_side is None else self.TARGET_COL_RIGHT
                 target_x  = self.TARGET_COL_LEFT
                 dx        = -self.MOVE_SPEED
                 color_natural = self.COLOR_NATURAL_LEFT
@@ -931,8 +967,10 @@ class MidiSongPlayer:
             row = n['row'] if going_right else (BOARD_HEIGHT - 1 - n['note_idx'])
             self.flying_notes.append({
                 'row': row, 'x': spawn_x,
+                'spawn_x': spawn_x,
                 'color': note_color,
                 'note_idx': n['note_idx'],
+                'hold_seconds': n.get('hold_seconds', 0.0),
                 'spawn_time': n['spawn_time'], 'play_time': n['play_time'],
                 'phase': 'fade', 'target_x': target_x, 'dx': dx,
             })
@@ -955,17 +993,24 @@ class MidiSongPlayer:
                 if n['dx'] < 0 and n['x'] <= n['target_x']:
                     n['x'] = n['target_x']
                     n['phase'] = 'linger'
-                    n['linger_until'] = elapsed + self.LINGER_SECONDS
+                    max_hold_cells = 1 + min(6, int(max(0.0, n.get('hold_seconds', 0.0)) * 4.0))
+                    n['linger_start_counter'] = self._update_counter
+                    n['linger_steps'] = max_hold_cells
                 elif n['dx'] > 0 and n['x'] >= n['target_x']:
                     n['x'] = n['target_x']
                     n['phase'] = 'linger'
-                    n['linger_until'] = elapsed + self.LINGER_SECONDS
+                    max_hold_cells = 1 + min(6, int(max(0.0, n.get('hold_seconds', 0.0)) * 4.0))
+                    n['linger_start_counter'] = self._update_counter
+                    n['linger_steps'] = max_hold_cells
 
         # Remove notes only after linger expires.
         kept = []
         for n in self.flying_notes:
             if n['phase'] == 'linger':
-                if elapsed >= n.get('linger_until', elapsed):
+                linger_start = n.get('linger_start_counter', self._update_counter)
+                linger_steps = n.get('linger_steps', 1)
+                steps_elapsed = max(0, (self._update_counter - linger_start) // self.MOVE_STEP_FRAMES)
+                if steps_elapsed >= linger_steps:
                     continue
             kept.append(n)
         self.flying_notes = kept
@@ -977,13 +1022,15 @@ class MidiSongPlayer:
     def check_piano_hit(self, side: str, note_idx: int) -> bool:
         """
         Returns True if there is a linger-phase note at the given side's piano
-        column matching note_idx.  Consumes the note (removes it) so it only
-        scores once per press.
+        column matching note_idx. Marks it as scored so it only awards points
+        once, but keeps the note visible for its natural retract/linger effect.
         """
         target_x = self.TARGET_COL_RIGHT if side == 'right' else self.TARGET_COL_LEFT
-        for i, n in enumerate(self.flying_notes):
+        for n in self.flying_notes:
             if n['phase'] == 'linger' and n['x'] == target_x and n['note_idx'] == note_idx:
-                self.flying_notes.pop(i)
+                if n.get('scored', False):
+                    return False
+                n['scored'] = True
                 return True
         return False
 
@@ -1004,6 +1051,83 @@ class MidiSongPlayer:
             b = int(n['color'][2] * brightness)
             result.append({**n, 'color': (r, g, b)})
         return result
+
+    def _predict_side_for_spawn_time(self, spawn_time):
+        """Predict side for future note preview in two-sided mode."""
+        if self.single_target_side is not None:
+            return self.single_target_side
+
+        # Start from current direction and count interval toggles until spawn_time.
+        right = self._going_right
+        if spawn_time >= self._next_interval_at:
+            toggles = int((spawn_time - self._next_interval_at) / self.DIRECTION_INTERVAL) + 1
+            if toggles % 2 == 1:
+                right = not right
+
+        return 'right' if right else 'left'
+
+    def get_next_hit_guides(self, limit=None, preview_window_seconds=10.0):
+        """Return upcoming hit guides with time-based opacity info."""
+        candidates = []
+
+        # Active on-screen notes are always authoritative.
+        for n in self.flying_notes:
+            side = 'right' if n.get('target_x') == self.TARGET_COL_RIGHT else 'left'
+            candidates.append((n.get('play_time', 0.0), side, n['note_idx']))
+
+        # Notes already due this frame but not yet released.
+        for n in self.spawn_queue:
+            side = n.get('forced_side')
+            if side is None:
+                side = self.single_target_side or ('right' if self._going_right else 'left')
+            candidates.append((n.get('play_time', 0.0), side, n['note_idx']))
+
+        # Upcoming notes from pending queue.
+        for n in self.pending_notes:
+            side = n.get('forced_side')
+            if side is None:
+                side = self._predict_side_for_spawn_time(n['spawn_time'])
+            candidates.append((n.get('play_time', 0.0), side, n['note_idx']))
+
+        if not candidates:
+            return []
+
+        candidates.sort(key=lambda x: x[0])
+
+        guides = []
+        seen = set()
+        now = self._current_elapsed
+        for play_time, side, note_idx in candidates:
+            key = (side, note_idx)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            seconds_away = max(0.0, play_time - now)
+            if seconds_away > preview_window_seconds:
+                continue
+
+            # Stronger log-based fade-in: stay very transparent until very close
+            # to hit, and reach max visibility at ~0.1s before hit.
+            log_ratio = math.log1p(seconds_away) / math.log1p(preview_window_seconds)
+            raw_visibility = (1.0 - log_ratio) ** 4
+            anchor_seconds = 0.1
+            anchor_ratio = math.log1p(anchor_seconds) / math.log1p(preview_window_seconds)
+            anchor_raw = max(1e-6, (1.0 - anchor_ratio) ** 4)
+            # Cap at 60% opacity (40% transparency) even right before hit.
+            visibility = min(0.6, raw_visibility / anchor_raw)
+
+            guides.append({
+                'side': side,
+                'note_idx': note_idx,
+                'seconds_away': seconds_away,
+                'visibility': max(0.0, min(1.0, visibility)),
+            })
+
+            if limit is not None and len(guides) >= limit:
+                break
+
+        return guides
 
 
 class Player:
@@ -1067,7 +1191,13 @@ class Player:
         if state_key in self.last_scored_states:
             del self.last_scored_states[state_key]
 
-class TestGame:
+class PianoGame:
+    SONG_BY_DIFFICULTY = {
+        'easy': 'Sweden - Minecraft',
+        'medium': 'Viva La Vida - Coldplay',
+        'hard': 'Moonlight Sonata - Beethoven',
+    }
+
     def __init__(self):
         self.board = [[BLACK for _ in range(BOARD_WIDTH)] for _ in range(BOARD_HEIGHT)]
 
@@ -1080,6 +1210,9 @@ class TestGame:
         self.game_over_start_time = None
         self.GAMEOVER_DURATION = 5.0
         self.countdown_sound_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "countdown.wav")
+        self.airhorn_sound_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "airhorn.wav")
+        self.applause_sound_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "applause.wav")
+        self.applause_fallback_sound_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "applause_1.wav")
         self.COUNTDOWN_STEP = 1.5
         self.COUNTDOWN_DURATION = self.COUNTDOWN_STEP * 3
 
@@ -1109,46 +1242,32 @@ class TestGame:
 
         # Side-select state
         self.side_select_start_time = None
-        self.SIDE_SELECT_DURATION = 4.0  # seconds
-        self.single_team_side = None  # None, 'left', or 'right'
+        self.SIDE_SELECT_DURATION = 4.0  # seconds (2s longer)
         self.active_piano_sides = {'left': True, 'right': True}
+        self.selected_difficulty = None
+        self.scoreboard_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "team_scores.json")
+        self._publish_scores()
 
-    def _button_idx_to_board_xy(self, button_idx):
-        """Convert touch index (0..511) to board coordinates."""
-        channel = button_idx // 64
-        led_index = button_idx % 64
-        row_in_channel = led_index // 16
-        col_in_row = led_index % 16
-        y = channel * 4 + row_in_channel
-        if row_in_channel % 2 == 0:
-            x = col_in_row
-        else:
-            x = 15 - col_in_row
-        return x, y
-
-    def _get_side_select_press_counts(self):
-        left_count = 0
-        right_count = 0
-        mid = BOARD_WIDTH // 2
-        for btn_idx, pressed in enumerate(self.button_states):
-            if not pressed:
-                continue
-            x, y = self._button_idx_to_board_xy(btn_idx)
-            if y < 0 or y >= BOARD_HEIGHT:
-                continue
-            if x < mid:
-                left_count += 1
-            else:
-                right_count += 1
-        return left_count, right_count
-
-    def _apply_side_mode(self):
-        left_enabled = self.single_team_side in (None, 'left')
-        right_enabled = self.single_team_side in (None, 'right')
-        self.active_piano_sides = {'left': left_enabled, 'right': right_enabled}
-        self.piano.set_active_sides(left_enabled=left_enabled, right_enabled=right_enabled)
-        if self.midi_player:
-            self.midi_player.set_single_side(self.single_team_side)
+    def _publish_scores(self):
+        left = self.player.side_scores.get('left', 0)
+        right = self.player.side_scores.get('right', 0)
+        payload = {
+            'left': left,
+            'right': right,
+            'total': self.player.points,
+            'state': self.state,
+            'winner': self.winner_side,
+            'difficulty': self.selected_difficulty,
+            'song': self.SONG_BY_DIFFICULTY.get(self.selected_difficulty),
+            'updated_at': time.time(),
+        }
+        tmp_file = self.scoreboard_file + ".tmp"
+        try:
+            with open(tmp_file, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+            os.replace(tmp_file, self.scoreboard_file)
+        except Exception as e:
+            print(f"Score publish failed: {e}", flush=True)
 
     def set_led(self, buffer, x, y, color):
         if x < 0 or x >= BOARD_WIDTH:
@@ -1199,6 +1318,9 @@ class TestGame:
 
     def _render_countdown(self, frame_buffer):
         """3-2-1 countdown: renders large pixel-art digits centred on the board."""
+        if self.countdown_start_time is None:
+            self.countdown_start_time = time.time()
+
         # 3-wide x 5-tall bitmaps for each digit
         GLYPHS = {
             3: [
@@ -1287,6 +1409,66 @@ class TestGame:
         except Exception as e:
             print(f"Countdown sound fallback failed: {e}", flush=True)
 
+    def _resolve_applause_path(self):
+        if os.path.exists(self.applause_sound_path):
+            return self.applause_sound_path
+        if os.path.exists(self.applause_fallback_sound_path):
+            return self.applause_fallback_sound_path
+        return None
+
+    def _play_round_end_sounds(self):
+        airhorn_path = self.airhorn_sound_path if os.path.exists(self.airhorn_sound_path) else None
+        applause_path = self._resolve_applause_path()
+
+        if not airhorn_path:
+            print(f"Airhorn sound missing: {self.airhorn_sound_path}", flush=True)
+        if not applause_path:
+            print(
+                f"Applause sound missing: {self.applause_sound_path} (or {self.applause_fallback_sound_path})",
+                flush=True,
+            )
+        if not airhorn_path and not applause_path:
+            return
+
+        try:
+            if PYGAME_AVAILABLE and pygame.mixer.get_init():
+                if airhorn_path:
+                    ch = pygame.mixer.find_channel(True)
+                    if ch is not None:
+                        ch.play(pygame.mixer.Sound(airhorn_path))
+                    else:
+                        pygame.mixer.Sound(airhorn_path).play()
+                if applause_path:
+                    ch = pygame.mixer.find_channel(True)
+                    if ch is not None:
+                        ch.play(pygame.mixer.Sound(applause_path))
+                    else:
+                        pygame.mixer.Sound(applause_path).play()
+                return
+        except Exception as e:
+            print(f"Round-end sound pygame failed: {e}", flush=True)
+
+        # Non-pygame fallback: launch both files so they can overlap.
+        try:
+            if os.name == 'nt':
+                if airhorn_path:
+                    os.startfile(airhorn_path)
+                if applause_path:
+                    os.startfile(applause_path)
+                return
+        except Exception as e:
+            print(f"Round-end sound fallback failed: {e}", flush=True)
+
+        # Last fallback if startfile path is unavailable.
+        try:
+            if WINSOUND_AVAILABLE:
+                if airhorn_path:
+                    winsound.PlaySound(airhorn_path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+                if applause_path:
+                    winsound.PlaySound(applause_path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+        except Exception as e:
+            print(f"Round-end sound winsound failed: {e}", flush=True)
+
     def _render_side_select(self, frame_buffer):
         """Show left half purple, right half cyan with a 5s countdown bar."""
         elapsed    = time.time() - self.side_select_start_time
@@ -1313,6 +1495,33 @@ class TestGame:
             color = WHITE if x < int(frac * BOARD_WIDTH) else BLACK
             self.set_led(frame_buffer, x, 0, color)
 
+    def _button_index_to_xy(self, button_idx):
+        """Convert matrix touch index (0..511) back to board coordinates."""
+        channel = button_idx // 64
+        led_index = button_idx % 64
+        row_in_channel = led_index // 16
+        pos_in_row = led_index % 16
+        x = pos_in_row if (row_in_channel % 2 == 0) else (15 - pos_in_row)
+        y = channel * 4 + row_in_channel
+        return x, y
+
+    def _count_side_select_presses(self):
+        """Count currently held touches on left and right half of the board."""
+        left = 0
+        right = 0
+        mid = BOARD_WIDTH // 2
+        for idx, pressed in enumerate(self.button_states):
+            if not pressed:
+                continue
+            x, y = self._button_index_to_xy(idx)
+            if not (0 <= y < BOARD_HEIGHT):
+                continue
+            if x < mid:
+                left += 1
+            else:
+                right += 1
+        return left, right
+
 
 
 
@@ -1333,18 +1542,19 @@ class TestGame:
 
     def _load_midi_by_difficulty(self, difficulty):
         """Load the MIDI file matching the chosen difficulty."""
-        test_dir  = os.path.dirname(os.path.abspath(__file__))
-        midi_path = os.path.join(test_dir, f"{difficulty}.mid")
+        self.selected_difficulty = difficulty
+        game_dir  = os.path.dirname(os.path.abspath(__file__))
+        midi_path = os.path.join(game_dir, f"{difficulty}.mid")
         if not os.path.exists(midi_path):
             # Fallback: first .mid found
-            mid_files = sorted(f for f in os.listdir(test_dir) if f.lower().endswith('.mid'))
+            mid_files = sorted(f for f in os.listdir(game_dir) if f.lower().endswith('.mid'))
             if not mid_files:
                 print("No MIDI file found!", flush=True)
                 return
-            midi_path = os.path.join(test_dir, mid_files[0])
+            midi_path = os.path.join(game_dir, mid_files[0])
         try:
             self.midi_player = MidiSongPlayer(midi_path, self.piano, difficulty=difficulty)
-            self.midi_player.set_single_side(self.single_team_side)
+            self._publish_scores()
             print(f"Lobby: loaded {os.path.basename(midi_path)} ({difficulty})", flush=True)
         except Exception as e:
             print(f"Failed to load MIDI: {e}", flush=True)
@@ -1444,7 +1654,11 @@ class TestGame:
     def start_game(self):
         with self.lock:
             self.reset_board()
+            self.player.points = 0
+            self.player.side_scores = {'left': 0, 'right': 0}
+            self.winner_side = None
             self.state = 'COUNTDOWN'
+            self._publish_scores()
             self.countdown_start_time = time.time()
             self._play_countdown_sound()
             print("3... 2... 1...", flush=True)
@@ -1493,34 +1707,57 @@ class TestGame:
             for note in self.midi_player.get_flying_notes():
                 x, y = note['x'], note['row']
                 if 0 <= x < BOARD_WIDTH and 0 <= y < BOARD_HEIGHT:
-                    self.set_led(frame_buffer, x, y, note['color'])
+                    hold_seconds = note.get('hold_seconds', 0.0)
+                    # Hold notes are drawn as horizontal bars (tail length by hold duration).
+                    max_hold_cells = 1 + min(6, int(max(0.0, hold_seconds) * 4.0))
+
+                    # Keep constant length while travelling; once at piano roll,
+                    # retract one block per movement step from the tail.
+                    if note.get('phase') == 'linger':
+                        linger_start = note.get('linger_start_counter', self.midi_player._update_counter)
+                        steps_elapsed = max(
+                            0,
+                            (self.midi_player._update_counter - linger_start) // self.midi_player.MOVE_STEP_FRAMES,
+                        )
+                        hold_cells = max(0, max_hold_cells - steps_elapsed)
+                    else:
+                        hold_cells = max_hold_cells
+
+                    if hold_cells <= 0:
+                        continue
+
+                    moving_right = note.get('dx', 1) > 0
+                    for i in range(hold_cells):
+                        px = x - i if moving_right else x + i
+                        if 0 <= px < BOARD_WIDTH:
+                            self.set_led(frame_buffer, px, y, note['color'])
 
         # ===========================================
         # MATRIX BORDER AND CENTER COLUMN
         # ===========================================
         # Draw white border around perimeter and vertical center column
 
-        # Left/right borders (2 columns wide each side) follow piano key color per row:
-        # sharps are black, naturals are white.
+        # Left/right borders (2 columns wide each side) are steady piano keys.
         sharp_note_positions = {1, 3, 6, 8, 10}
         for y in range(BOARD_HEIGHT):
             note_idx = (BOARD_HEIGHT - 1) - y
             note_pos = note_idx % 12
-            key_color = BLACK if note_pos in sharp_note_positions else WHITE
+            base_key_color = (70, 70, 70) if note_pos in sharp_note_positions else WHITE
+            key_color = base_key_color
+            left_border_color = key_color if self.active_piano_sides.get('left', True) else DIM_DARK_BLUE
+            right_border_color = key_color if self.active_piano_sides.get('right', True) else DIM_DARK_BLUE
 
             # Left border (columns 0 and 1)
-            left_color = key_color if self.active_piano_sides.get('left', True) else DIM_DARK_BLUE
-            self.set_led(frame_buffer, 0, y, left_color)
-            self.board[y][0] = left_color
-            self.set_led(frame_buffer, 1, y, left_color)
-            self.board[y][1] = left_color
+            self.set_led(frame_buffer, 0, y, left_border_color)
+            self.board[y][0] = left_border_color
+            self.set_led(frame_buffer, 1, y, left_border_color)
+            self.board[y][1] = left_border_color
 
             # Right border (last two columns)
-            right_color = key_color if self.active_piano_sides.get('right', True) else DIM_DARK_BLUE
-            self.set_led(frame_buffer, BOARD_WIDTH - 2, y, right_color)
-            self.board[y][BOARD_WIDTH - 2] = right_color
-            self.set_led(frame_buffer, BOARD_WIDTH - 1, y, right_color)
-            self.board[y][BOARD_WIDTH - 1] = right_color
+            self.set_led(frame_buffer, BOARD_WIDTH - 2, y, right_border_color)
+            self.board[y][BOARD_WIDTH - 2] = right_border_color
+            self.set_led(frame_buffer, BOARD_WIDTH - 1, y, right_border_color)
+            self.board[y][BOARD_WIDTH - 1] = right_border_color
 
         # ===========================================
         # HORIZONTAL MATRIX RAIN FROM CENTER AREA
@@ -1559,6 +1796,33 @@ class TestGame:
         if self.midi_player and self.state == 'PLAYING':
             self.midi_player.update()
 
+        # Show upcoming hit tiles with logarithmic fade-in based on time-to-hit.
+        if self.midi_player and self.state == 'PLAYING':
+            guides = self.midi_player.get_next_hit_guides(limit=None, preview_window_seconds=10.0)
+            for g in guides:
+                side = g['side']
+                note_idx = g['note_idx']
+                if side == 'left' and not self.active_piano_sides.get('left', True):
+                    continue
+                if side == 'right' and not self.active_piano_sides.get('right', True):
+                    continue
+
+                x = 2 if side == 'left' else (BOARD_WIDTH - 3)
+                y = (BOARD_HEIGHT - 1) - note_idx
+                if 0 <= y < BOARD_HEIGHT:
+                    visibility = g.get('visibility', 0.0)
+                    if visibility <= 0.0:
+                        continue
+
+                    bg = DIM_DARK_BLUE
+                    guide_color = (
+                        int(bg[0] + (YELLOW[0] - bg[0]) * visibility),
+                        int(bg[1] + (YELLOW[1] - bg[1]) * visibility),
+                        int(bg[2] + (YELLOW[2] - bg[2]) * visibility),
+                    )
+                    self.set_led(frame_buffer, x, y, guide_color)
+                    self.board[y][x] = guide_color
+
         # Step 3: Update animation timing
         self.time_counter += 1
         self.prev_button_states = self.button_states.copy()
@@ -1585,27 +1849,40 @@ class TestGame:
                     self._load_midi_by_difficulty(winner)
                     self.state = 'SIDE_SELECT'
                     self.side_select_start_time = time.time()
-                    print(f"Choose your side! ({self.SIDE_SELECT_DURATION:.0f} seconds)", flush=True)
+                    print("Choose your side! (4 seconds)", flush=True)
                 return
 
             if self.state == 'SIDE_SELECT':
                 elapsed = time.time() - self.side_select_start_time
                 if elapsed >= self.SIDE_SELECT_DURATION:
-                    left_pressed, right_pressed = self._get_side_select_press_counts()
-                    if left_pressed > 0 and right_pressed == 0:
-                        self.single_team_side = 'left'
-                    elif right_pressed > 0 and left_pressed == 0:
-                        self.single_team_side = 'right'
+                    left_count, right_count = self._count_side_select_presses()
+                    if left_count > 0 and right_count == 0:
+                        self.active_piano_sides = {'left': True, 'right': False}
+                    elif right_count > 0 and left_count == 0:
+                        self.active_piano_sides = {'left': False, 'right': True}
                     else:
-                        self.single_team_side = None
+                        self.active_piano_sides = {'left': True, 'right': True}
 
-                    self._apply_side_mode()
-                    mode_label = self.single_team_side.upper() if self.single_team_side else 'BOTH'
-                    print(f"Side select result: left={left_pressed}, right={right_pressed} -> {mode_label}", flush=True)
+                    self.piano.configure_active_sides(
+                        enable_left=self.active_piano_sides['left'],
+                        enable_right=self.active_piano_sides['right'],
+                    )
+                    if self.midi_player:
+                        self.midi_player.configure_active_sides(
+                            enable_left=self.active_piano_sides['left'],
+                            enable_right=self.active_piano_sides['right'],
+                        )
+
+                    print(
+                        f"Side select: left={left_count}, right={right_count} -> active {self.active_piano_sides}",
+                        flush=True,
+                    )
                     self.start_game()
                 return
 
             if self.state == 'COUNTDOWN':
+                if self.countdown_start_time is None:
+                    self.countdown_start_time = time.time()
                 elapsed = time.time() - self.countdown_start_time
                 if elapsed >= self.COUNTDOWN_DURATION:
                     print("FIGHT! Game Starting...", flush=True)
@@ -1636,6 +1913,7 @@ class TestGame:
                                 self.player.points += 1
                                 left  = self.player.side_scores.get('left', 0)
                                 right = self.player.side_scores.get('right', 0)
+                                self._publish_scores()
                                 print(f"SCORE! {side.upper()} side hit note {note_idx} | Left: {left}  Right: {right}  Total: {self.player.points}")
 
                     # Check if song finished
@@ -1645,6 +1923,8 @@ class TestGame:
                         self.winner_side = 'left' if left_score > right_score else 'right'
                         self.state = 'GAMEOVER'
                         self.game_over_start_time = time.time()
+                        self._publish_scores()
+                        self._play_round_end_sounds()
                         print(f"GAME OVER! Winner: {self.winner_side.upper()} side ({left_score} vs {right_score})", flush=True)
                     return
 
@@ -1654,6 +1934,8 @@ class TestGame:
                 elif time.time() - self.game_over_start_time >= self.GAMEOVER_DURATION:
                     print("Closing program after winner screen.", flush=True)
                     self.running = False
+                    close_score_window()
+                    os._exit(0)
                 return
 
 class NetworkManager:
@@ -1844,8 +2126,59 @@ def game_thread_func(game):
         game.tick()
         time.sleep(0.01)
 
+
+def launch_score_window():
+    """Launch separate team score window process."""
+    global SCORE_WINDOW_PROCESS
+
+    if SCORE_WINDOW_PROCESS is not None and SCORE_WINDOW_PROCESS.poll() is None:
+        return
+
+    game_dir = os.path.dirname(os.path.abspath(__file__))
+    score_window_path = os.path.join(game_dir, "score_window.py")
+    if not os.path.exists(score_window_path):
+        print(f"Score window script missing: {score_window_path}", flush=True)
+        return
+
+    try:
+        kwargs = {
+            "cwd": game_dir,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+        }
+        if os.name == "nt":
+            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            kwargs["start_new_session"] = True
+
+        SCORE_WINDOW_PROCESS = subprocess.Popen([sys.executable, score_window_path], **kwargs)
+        print("Score window launched.", flush=True)
+    except Exception as e:
+        print(f"Failed to launch score window: {e}", flush=True)
+
+
+def close_score_window():
+    """Close score window process if it is running."""
+    global SCORE_WINDOW_PROCESS
+
+    proc = SCORE_WINDOW_PROCESS
+    SCORE_WINDOW_PROCESS = None
+    if proc is None:
+        return
+
+    try:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=1.5)
+            except Exception:
+                proc.kill()
+    except Exception as e:
+        print(f"Failed to close score window: {e}", flush=True)
+
 if __name__ == "__main__":
-    game = TestGame()
+    launch_score_window()
+    game = PianoGame()
     net = NetworkManager(game)
     net.start_bg()
 
@@ -1863,6 +2196,7 @@ if __name__ == "__main__":
                 game.running = False
     except KeyboardInterrupt:
         game.running = False
-
-    net.running = False
-    print("Exiting...")
+    finally:
+        net.running = False
+        close_score_window()
+        print("Exiting...")
