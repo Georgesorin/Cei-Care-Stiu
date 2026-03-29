@@ -10,6 +10,8 @@ import math
 import array as _array
 
 import json
+import tkinter as tk
+from tkinter import font as tkfont
 
 try:
     import pygame
@@ -1717,25 +1719,123 @@ if __name__ == "__main__":
     gt.daemon = True
     gt.start()
 
-    print("Battle Blaster Server Running.")
-    print("Commands: 'start', 'restart', 'quit'")
-    print("Or press any button on the hardware to start from LOBBY.")
+    # ── tkinter UI ────────────────────────────────────────────────────────────
+    BG        = "#0a0a0a"
+    BG_CARD   = "#141414"
+    RED_HEX   = "#ff2222"
+    BLUE_HEX  = "#2266ff"
+    WHITE_HEX = "#ffffff"
+    DIM_HEX   = "#555555"
+    BTN_BG    = "#1e1e1e"
+    BTN_HO    = "#2e2e2e"
 
-    try:
-        while game.running:
-            cmd = input("> ").strip().lower()
-            if cmd in ('quit', 'exit'):
-                game.running = False
-            elif cmd == 'start':
-                game.start_game()
-                print("Game started.")
-            elif cmd == 'restart':
-                game.restart_round()
-                print("Round restarted.")
-            else:
-                print("Unknown command. Use: start | restart | quit")
-    except KeyboardInterrupt:
-        game.running = False
+    root = tk.Tk()
+    root.title("Battle Blaster — Control")
+    root.configure(bg=BG)
+    root.resizable(False, False)
 
-    net.running = False
-    print("Exiting...")
+    # ── Control window content ────────────────────────────────────────────────
+    tk.Label(root, text="⚡ BATTLE BLASTER", bg=BG,
+             fg=WHITE_HEX, font=("Consolas", 18, "bold")).pack(pady=(18, 4))
+
+    state_var = tk.StringVar(value="● LOBBY")
+    state_lbl = tk.Label(root, textvariable=state_var, bg=BG,
+                         fg=DIM_HEX, font=("Consolas", 11))
+    state_lbl.pack(pady=(0, 16))
+
+    def make_btn(parent, text, cmd, fg=WHITE_HEX):
+        btn = tk.Button(parent, text=text, command=cmd,
+                        bg=BTN_BG, fg=fg, activebackground=BTN_HO,
+                        activeforeground=fg, relief="flat",
+                        font=("Consolas", 13, "bold"),
+                        width=20, pady=8, cursor="hand2")
+        btn.pack(pady=5, padx=30)
+        btn.bind("<Enter>", lambda e: btn.configure(bg=BTN_HO))
+        btn.bind("<Leave>", lambda e: btn.configure(bg=BTN_BG))
+        return btn
+
+    make_btn(root, "▶  START GAME",    lambda: game.start_game(),    fg="#44ff88")
+    make_btn(root, "↺  RESTART ROUND", lambda: game.restart_round(), fg="#ffcc00")
+    make_btn(root, "✕  QUIT",          lambda: os._exit(0),           fg="#ff4444")
+
+    tk.Label(root, text="", bg=BG).pack(pady=6)
+
+    # ── Scoreboard window ─────────────────────────────────────────────────────
+    board = tk.Toplevel(root)
+    board.title("Battle Blaster — Scoreboard")
+    board.configure(bg=BG)
+    board.resizable(True, True)
+
+    # Position scoreboard to the right of the control window
+    root.update_idletasks()
+    cx = root.winfo_x() + root.winfo_width() + 12
+    cy = root.winfo_y()
+    board.geometry(f"+{cx}+{cy}")
+
+    tk.Label(board, text="SCOREBOARD", bg=BG,
+             fg=DIM_HEX, font=("Consolas", 11, "bold")).pack(pady=(16, 8))
+
+    # ── Team A ────────────────────────────────────────────────────────────────
+    frame_a = tk.Frame(board, bg=BG_CARD, bd=0)
+    frame_a.pack(fill="x", padx=24, pady=6)
+    tk.Label(frame_a, text="  TEAM A  ", bg=BG_CARD,
+             fg=RED_HEX, font=("Consolas", 13, "bold")).pack(side="left", padx=10, pady=10)
+    score_a_var = tk.StringVar(value="0")
+    tk.Label(frame_a, textvariable=score_a_var, bg=BG_CARD,
+             fg=RED_HEX, font=("Consolas", 36, "bold"), width=4).pack(side="right", padx=10)
+
+    # ── Team B ────────────────────────────────────────────────────────────────
+    frame_b = tk.Frame(board, bg=BG_CARD, bd=0)
+    frame_b.pack(fill="x", padx=24, pady=6)
+    tk.Label(frame_b, text="  TEAM B  ", bg=BG_CARD,
+             fg=BLUE_HEX, font=("Consolas", 13, "bold")).pack(side="left", padx=10, pady=10)
+    score_b_var = tk.StringVar(value="0")
+    tk.Label(frame_b, textvariable=score_b_var, bg=BG_CARD,
+             fg=BLUE_HEX, font=("Consolas", 36, "bold"), width=4).pack(side="right", padx=10)
+
+    # ── Timer ─────────────────────────────────────────────────────────────────
+    tk.Label(board, text="TIME REMAINING", bg=BG,
+             fg=DIM_HEX, font=("Consolas", 10)).pack(pady=(14, 2))
+    timer_var = tk.StringVar(value="--:--")
+    timer_lbl = tk.Label(board, textvariable=timer_var, bg=BG,
+                         fg=WHITE_HEX, font=("Consolas", 48, "bold"))
+    timer_lbl.pack(pady=(0, 18))
+
+    # ── Periodic refresh ──────────────────────────────────────────────────────
+    STATE_COLORS = {
+        'LOBBY':    DIM_HEX,
+        'STARTUP':  "#ffcc00",
+        'PLAYING':  "#44ff88",
+        'GAMEOVER': "#ff4444",
+    }
+
+    def refresh():
+        # State label + color
+        st = game.state
+        state_var.set(f"● {st}")
+        state_lbl.configure(fg=STATE_COLORS.get(st, DIM_HEX))
+
+        # Scores
+        score_a_var.set(str(game.teams['A'].score))
+        score_b_var.set(str(game.teams['B'].score))
+
+        # Timer
+        if st == 'PLAYING':
+            elapsed   = time.time() - game.game_start_time
+            remaining = max(0.0, GAME_DURATION - elapsed)
+            mins  = int(remaining) // 60
+            secs  = int(remaining) % 60
+            timer_var.set(f"{mins:02d}:{secs:02d}")
+            # Turn red when under 30 s
+            timer_lbl.configure(fg="#ff4444" if remaining < 30 else WHITE_HEX)
+        elif st == 'GAMEOVER':
+            timer_var.set("00:00")
+            timer_lbl.configure(fg="#ff4444")
+        else:
+            timer_var.set("--:--")
+            timer_lbl.configure(fg=DIM_HEX)
+
+        root.after(200, refresh)   # refresh every 200 ms
+
+    refresh()
+    root.mainloop()
