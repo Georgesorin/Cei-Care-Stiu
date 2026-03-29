@@ -21,10 +21,14 @@ DEBUG_INPUT = 1  # 1 = print input/trigger debug logs
 FRAME_DATA_LEN = LEDS_PER_CHANNEL * NUM_CHANNELS * 3
 TRIGGER_PACKET_LEN = 687
 
-# Real hardware can have different channel wiring than simulator.
-# Simulator uses logical RGB; real room can be configured (e.g. GRB).
-REAL_ROOM_COLOR_ORDER = "GRB"
+# Real hardware can have different channel/LED wiring than simulator.
+# These defaults reflect current in-room measurements.
+REAL_ROOM_COLOR_ORDER = "RGB"
+REAL_ROOM_SWAP_RB = 1      # Real room shows red as blue without this correction.
+REAL_ROOM_LED_SHIFT = 1    # Real room LEDs appear one index left; shift output +1.
 OUTPUT_COLOR_ORDER = "RGB"
+OUTPUT_SWAP_RB = False
+OUTPUT_LED_SHIFT = 0
 
 # Real hardware ports (used when a device is discovered on the LAN)
 DEVICE_SEND_PORT = 4626    # Send light commands to device
@@ -188,13 +192,24 @@ def map_output_color(r, g, b):
 		return b, g, r
 	if OUTPUT_COLOR_ORDER == "GBR":
 		return g, b, r
-	return r, g, b
+	out_r, out_g, out_b = r, g, b
+	if OUTPUT_SWAP_RB:
+		out_r, out_b = out_b, out_r
+	return out_r, out_g, out_b
+
+
+def map_output_led_index(led):
+	out_led = led
+	if OUTPUT_LED_SHIFT:
+		out_led = (led + OUTPUT_LED_SHIFT) % LEDS_PER_CHANNEL
+	return out_led
 
 
 def build_frame_data(led_states):
 	frame = bytearray(FRAME_DATA_LEN)
 	for (ch, led), (r, g, b) in led_states.items():
 		r, g, b = map_output_color(r, g, b)
+		led = map_output_led_index(led)
 		ch_idx = ch - 1
 		if 0 <= ch_idx < NUM_CHANNELS and 0 <= led < LEDS_PER_CHANNEL:
 			frame[led * 12 + ch_idx] = g
@@ -1134,11 +1149,19 @@ if __name__ == "__main__":
 		print("[Discovery] Scanning LAN for Evil Eye hardware...")
 		device_ip, send_port, recv_port = run_discovery()
 		is_real_target = (send_port == DEVICE_SEND_PORT and recv_port == DEVICE_RECV_PORT)
+		OUTPUT_SWAP_RB = bool(is_real_target and REAL_ROOM_SWAP_RB)
+		OUTPUT_LED_SHIFT = REAL_ROOM_LED_SHIFT if is_real_target else 0
 		OUTPUT_COLOR_ORDER = REAL_ROOM_COLOR_ORDER if is_real_target else "RGB"
 		if is_real_target:
-			print(f"[Compat] Real-room color order active: {OUTPUT_COLOR_ORDER}")
+			print(
+				f"[Compat] Real-room mapping active: order={OUTPUT_COLOR_ORDER}, "
+				f"swap_rb={OUTPUT_SWAP_RB}, led_shift={OUTPUT_LED_SHIFT}"
+			)
 		else:
-			print(f"[Compat] Simulator/default color mapping active: {OUTPUT_COLOR_ORDER}")
+			print(
+				f"[Compat] Simulator/default mapping active: order={OUTPUT_COLOR_ORDER}, "
+				f"swap_rb={OUTPUT_SWAP_RB}, led_shift={OUTPUT_LED_SHIFT}"
+			)
 		print(f"[Discovery] Connecting to {device_ip}:{send_port} (recv:{recv_port})")
 		game = GamblerFugitiveGame(device_ip, send_port, recv_port)
 		game.mainloop()
