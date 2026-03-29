@@ -23,6 +23,15 @@ import time
 import tkinter as tk
 import winsound
 
+try:
+    import screeninfo as _screeninfo
+    def _get_monitors():
+        return _screeninfo.get_monitors()
+except ImportError:
+    _screeninfo = None
+    def _get_monitors():
+        return []
+
 # ── Game timing (seconds) ────────────────────────────────────────────────────
 GAME_DURATION   = 120.0  # total game length
 GREEN_DURATION  =   5.0  # time to find and press the green buttons
@@ -51,6 +60,12 @@ DEVICE_IP   = "169.254.182.11"   # e.g. "192.168.1.7" or "255.255.255.255"
 SEND_PORT   = 4626   # port the Simulator/device listens on  (matches Simulator "Port IN")
 RECV_PORT   = 7800   # port we listen on for button events   (matches Simulator "Port OUT")
 IFACE_INDEX = 1      # auto-select this interface index for discovery (None = ask at startup)
+
+# ── Monitor layout ────────────────────────────────────────────────────────────
+# Indices refer to the list printed at startup.  Set both to 0 for single-screen.
+DISPLAY_MONITOR    = 1     # INSIDE  screen – players see score / HIDE / CATCH here
+CONTROL_MONITOR    = 0     # OUTSIDE screen – operator uses Start / End / Reset here
+DISPLAY_FULLSCREEN = True  # fill the inside screen entirely (press F11 to toggle)
 
 # ── Config loading ────────────────────────────────────────────────────────────
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -643,14 +658,48 @@ class ControlUI:
 
 # ── Entry point helper ────────────────────────────────────────────────────────
 class GameUI:
-    """Thin wrapper that owns the Tk root and both sub-windows."""
+    """Owns the Tk root and both sub-windows; positions each on its monitor."""
 
     def __init__(self, game: HideAndSeekGame):
         self.root = tk.Tk()
+        self._fs = False                   # fullscreen state for the display window
         self.display = DisplayUI(game, self.root)
         self.control = ControlUI(game, self.root)
         self.root.protocol("WM_DELETE_WINDOW",
                             lambda: _shutdown(game, self.root))
+
+        monitors = _get_monitors()
+        if monitors:
+            print("Detected monitors:")
+            for i, m in enumerate(monitors):
+                print(f"  [{i}] {getattr(m,'name',f'Monitor {i}')}  {m.width}x{m.height}  @({m.x},{m.y})")
+
+        # ── position Display window (inside screen) ──────────────────────────
+        dm = monitors[DISPLAY_MONITOR] if len(monitors) > DISPLAY_MONITOR else None
+        if dm:
+            if DISPLAY_FULLSCREEN:
+                # Move to the right monitor first, then go fullscreen
+                self.root.geometry(f"{dm.width}x{dm.height}+{dm.x}+{dm.y}")
+                self.root.attributes("-fullscreen", True)
+                self._fs = True
+            else:
+                self.root.geometry(f"{dm.width}x{dm.height}+{dm.x}+{dm.y}")
+        # F11 toggles fullscreen on the display window
+        self.root.bind("<F11>", self._toggle_fs)
+
+        # ── position Control window (outside screen) ─────────────────────────
+        cm = monitors[CONTROL_MONITOR] if len(monitors) > CONTROL_MONITOR else None
+        if cm:
+            # Centre the control window on its monitor
+            cw, ch = 420, 180
+            cx = cm.x + (cm.width  - cw) // 2
+            cy = cm.y + (cm.height - ch) // 2
+            self.control.win.geometry(f"{cw}x{ch}+{cx}+{cy}")
+        self.control.win.lift()            # bring to front after positioning
+
+    def _toggle_fs(self, _event=None):
+        self._fs = not self._fs
+        self.root.attributes("-fullscreen", self._fs)
 
     def run(self):
         self.root.mainloop()
@@ -736,6 +785,13 @@ def run_discovery_flow():
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    # DPI awareness so windows land on the right pixel on HiDPI setups
+    try:
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        pass
+
     cfg = _load_config()
     # Run discovery unless DEVICE_IP is already set at the top of the file
     if DEVICE_IP is None:
