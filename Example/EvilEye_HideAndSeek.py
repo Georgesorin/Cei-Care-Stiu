@@ -21,12 +21,27 @@ import socket
 import threading
 import time
 import tkinter as tk
+import winsound
 
 # ── Game timing (seconds) ────────────────────────────────────────────────────
-GREEN_DURATION  = 5.0   # time to find and press the green buttons
-RED_DURATION    =  3.0   # time to hide from the evil eye
-HIDDEN_DURATION =  5.0   # stay hidden
-FLASH_DURATION  =  1.0   # end-of-round flash
+GAME_DURATION   = 120.0  # total game length
+GREEN_DURATION  =   5.0  # time to find and press the green buttons
+RED_DURATION    =   3.0  # time to hide from the evil eye
+HIDDEN_DURATION =   5.0  # stay hidden
+FLASH_DURATION  =   1.0  # end-of-round flash
+
+# ── Sound effects (list of (frequency_hz, duration_ms) beep sequences) ───────
+SND_GREEN_HIT  = [(880, 60),  (1100, 100)]          # ✔ button pressed correctly
+SND_GREEN_MISS = [(350, 150), (260, 220)]            # ✘ time ran out, button missed
+SND_CAUGHT     = [(1400, 70), (1400, 70), (1400, 70)] # 👁 eye caught you
+SND_SAFE       = [(660, 80),  (880, 160)]            # 😌 survived the eye phase
+
+def play_sound(sequence):
+    """Play a beep sequence in a background thread (non-blocking)."""
+    def _play():
+        for freq, dur in sequence:
+            winsound.Beep(freq, dur)
+    threading.Thread(target=_play, daemon=True).start()
 
 # ── Port / IP overrides ───────────────────────────────────────────────────────
 # Set to None to auto-detect from eye_ctrl_config.json; set a number to override.
@@ -274,68 +289,125 @@ class HideAndSeekGame:
         self.service = service
 
         self.score         = 0
+        self.round_num     = 0
+        self.game_end_at   = 0.0
         self.state         = STATE_IDLE
         self.state_end_at  = 0.0
-        self.status_msg    = "Starting…"
+        self.status_msg    = "Press Start to begin."
         self.red_wall      = None
 
-        self._green_buttons    = {}
+        self._green_buttons    = set()   # set of (ch, led) tuples
         self._pressed_in_green = set()
+        self._caught_this_red  = False
         self._lock             = threading.Lock()
-        self._running          = True
+        self._running          = False          # starts paused; press Start to begin
+        self._start_evt        = threading.Event()
 
         self.service.on_button_state = self._on_button_state
+
+    # ── Game control (called from UI buttons) ─────────────────────────────────
+    def start(self):
+        with self._lock:
+            if self._running:
+                return          # already running
+            self._running  = True
+            self.round_num = 0
+            self.game_end_at = time.time() + GAME_DURATION
+            self.status_msg = "Game started!"
+        self._start_evt.set()
+
+    def end(self):
+        with self._lock:
+            self._running = False
+            self.state      = STATE_IDLE
+            self.status_msg = "Game ended. Press Start to play again."
+        self.service.all_off()
+
+    def reset(self):
+        with self._lock:
+            self._running = False
+            self.score      = 0
+            self.state      = STATE_IDLE
+            self.status_msg = "Score reset. Press Start to begin."
+        self.service.all_off()
 
     def _on_button_state(self, ch, led, is_trig, is_disc):
         if not is_trig:
             return
         with self._lock:
             if self.state == STATE_GREEN:
-                if ch in self._green_buttons and self._green_buttons[ch] == led:
+                if (ch, led) in self._green_buttons:
                     if (ch, led) not in self._pressed_in_green:
                         self._pressed_in_green.add((ch, led))
                         self.score += 1
                         self.service.set_led(ch, led, 0, 0, 0)
+                        play_sound(SND_GREEN_HIT)
             elif self.state == STATE_RED:
                 if ch == self.red_wall:
                     self.score -= 1
+                    self._caught_this_red = True
+                    play_sound(SND_CAUGHT)
 
     def run(self):
-        while self._running:
-            self._run_round()
+        """Background thread: waits for Start, runs rounds, then idles again."""
+        while True:
+            self._start_evt.wait()      # block until start() is called
+            self._start_evt.clear()
+            while self._running:
+                if time.time() >= self.game_end_at:
+                    break               # 2-minute limit reached
+                self._run_round()
+            # round loop exited (time up or stopped)
+            with self._lock:
+                self._running   = False
+                self.state      = STATE_IDLE
+                self.status_msg = f"Game over! Final score: {self.score}  |  Press Start to play again."
+            self.service.all_off()
 
     def stop(self):
         self._running = False
 
     def _run_round(self):
         # Phase 1 – GREEN
-        walls = random.sample([1, 2, 3, 4], 2)
-        green_buttons = {w: random.randint(1, 10) for w in walls}
+        # Round number increments each catch phase; buttons = 1 + round_num (min 2)
+        with self._lock:
+            self.round_num += 1
+            round_num = self.round_num
+
+        all_positions = [(ch, led)
+                         for ch  in range(1, NUM_CHANNELS + 1)
+                         for led in range(1, LEDS_PER_CHANNEL)]   # led 0 is the Eye
+        n_buttons    = min(1 + round_num, len(all_positions))
+        green_buttons = set(random.sample(all_positions, n_buttons))
+        walls_used    = sorted({ch for ch, _ in green_buttons})
 
         with self._lock:
-            self._green_buttons    = dict(green_buttons)
+            self._green_buttons    = set(green_buttons)
             self._pressed_in_green = set()
 
         self.service.all_off()
-        for ch, led in green_buttons.items():
+        for ch, led in green_buttons:
             self.service.set_led(ch, led, 0, 255, 0)
 
+        walls_str = ", ".join(f"W{w}" for w in walls_used)
         with self._lock:
             self.state        = STATE_GREEN
             self.state_end_at = time.time() + GREEN_DURATION
-            self.status_msg   = f"Find the green buttons! Wall {walls[0]} & Wall {walls[1]}"
+            self.status_msg   = f"Round {round_num} – {n_buttons} buttons on {walls_str}"
 
         time.sleep(GREEN_DURATION)
 
         with self._lock:
-            for ch, led in green_buttons.items():
-                if (ch, led) not in self._pressed_in_green:
-                    self.score -= 1
+            missed = [btn for btn in green_buttons if btn not in self._pressed_in_green]
+            self.score -= len(missed)
+        if missed:
+            play_sound(SND_GREEN_MISS)
 
         # Phase 2 – RED
         red_wall = random.choice([1, 2, 3, 4])
         with self._lock:
             self.red_wall = red_wall
+            self._caught_this_red = False
 
         self.service.all_off()
         for led in range(LEDS_PER_CHANNEL):
@@ -349,6 +421,11 @@ class HideAndSeekGame:
         time.sleep(RED_DURATION)
 
         # Phase 3 – HIDDEN
+        with self._lock:
+            was_caught = self._caught_this_red
+        if not was_caught:
+            play_sound(SND_SAFE)
+
         self.service.all_off()
         with self._lock:
             self.state        = STATE_HIDDEN
@@ -376,13 +453,20 @@ class HideAndSeekGame:
         time.sleep(0.2)
 
 
-# ── UI ────────────────────────────────────────────────────────────────────────
-class GameUI:
+# ── Shared shutdown helper ────────────────────────────────────────────────────
+def _shutdown(game: "HideAndSeekGame", root: tk.Tk):
+    game.stop()
+    game.service.stop()
+    root.destroy()
+
+
+# ── Display window  (HIDE/CATCH · phase · timer · status · score) ─────────────
+class DisplayUI:
     PHASE_COLORS = {
         STATE_GREEN:  "#00cc44",
         STATE_RED:    "#ff3333",
         STATE_HIDDEN: "#888888",
-        STATE_FLASH:  "#ffffff",  # overridden dynamically in _tick
+        STATE_FLASH:  "#ffffff",
         STATE_IDLE:   "#555555",
     }
     PHASE_LABELS = {
@@ -390,72 +474,183 @@ class GameUI:
         STATE_RED:    "HIDE FROM THE EYE",
         STATE_HIDDEN: "STAY HIDDEN",
         STATE_FLASH:  "ROUND OVER",
-        STATE_IDLE:   "STARTING…",
+        STATE_IDLE:   "WAITING…",
     }
 
-    def __init__(self, game: HideAndSeekGame):
+    def __init__(self, game: HideAndSeekGame, root: tk.Tk):
         self.game = game
-        self.root = tk.Tk()
-        self.root.title("Evil Eye – Hide & Seek")
+        self.root = root                      # shared Tk root
+
+        self.root.title("Evil Eye – Display")
         self.root.configure(bg="#111111")
-        self.root.resizable(False, False)
+        self.root.resizable(True, True)
+        self.root.minsize(320, 400)
 
-        self._phase_label = tk.Label(
-            self.root, text="STARTING…",
-            font=("Consolas", 28, "bold"),
-            bg="#111111", fg="#555555", width=22, anchor="center",
+        # Single column expands with the window
+        self.root.grid_columnconfigure(0, weight=1)
+        for r in range(7):
+            self.root.grid_rowconfigure(r, weight=1)
+
+        # HIDE / CATCH
+        self._cmd_label = tk.Label(
+            self.root, text="CATCH",
+            font=("Consolas", 64, "bold"),
+            bg="#111111", fg="#00cc44", anchor="center",
         )
-        self._phase_label.grid(row=0, column=0, columnspan=2, padx=20, pady=(20, 4))
+        self._cmd_label.grid(row=0, column=0, sticky="nsew", padx=30, pady=(24, 6))
 
+        # Phase name
+        self._phase_label = tk.Label(
+            self.root, text="WAITING…",
+            font=("Consolas", 22, "bold"),
+            bg="#111111", fg="#555555", anchor="center",
+        )
+        self._phase_label.grid(row=1, column=0, sticky="nsew", padx=30, pady=(0, 4))
+
+        # Phase countdown timer
         self._timer_label = tk.Label(
             self.root, text="",
-            font=("Consolas", 16),
-            bg="#111111", fg="#aaaaaa",
+            font=("Consolas", 15),
+            bg="#111111", fg="#aaaaaa", anchor="center",
         )
-        self._timer_label.grid(row=1, column=0, columnspan=2, pady=(0, 6))
+        self._timer_label.grid(row=2, column=0, sticky="nsew", pady=(0, 4))
 
-        self._status_label = tk.Label(
+        # Game time remaining + round number
+        self._game_timer_label = tk.Label(
             self.root, text="",
-            font=("Consolas", 11),
-            bg="#111111", fg="#888888", wraplength=700,
+            font=("Consolas", 13),
+            bg="#111111", fg="#666666", anchor="center",
         )
-        self._status_label.grid(row=2, column=0, columnspan=2, padx=20, pady=(0, 8))
+        self._game_timer_label.grid(row=3, column=0, sticky="nsew", pady=(0, 4))
 
+        # Status detail
+        self._status_label = tk.Label(
+            self.root, text="Press Start in the control panel.",
+            font=("Consolas", 11),
+            bg="#111111", fg="#888888", wraplength=500, anchor="center",
+        )
+        self._status_label.grid(row=4, column=0, sticky="nsew", padx=30, pady=(0, 12))
+
+        # Score heading
         tk.Label(self.root, text="SCORE", font=("Consolas", 10, "bold"),
-                 bg="#111111", fg="#555555").grid(
-            row=3, column=0, padx=(40, 4), pady=(0, 20), sticky="e")
+                 bg="#111111", fg="#555555", anchor="center").grid(
+            row=5, column=0, sticky="nsew", pady=(0, 2))
 
+        # Score value
         self._score_label = tk.Label(
             self.root, text="0",
-            font=("Consolas", 32, "bold"),
-            bg="#111111", fg="#00ff88",
+            font=("Consolas", 42, "bold"),
+            bg="#111111", fg="#00ff88", anchor="center",
         )
-        self._score_label.grid(row=3, column=1, padx=(4, 40), pady=(0, 20), sticky="w")
+        self._score_label.grid(row=6, column=0, sticky="nsew", pady=(0, 24))
 
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._tick()
 
     def _tick(self):
         state = self.game.state
-        if state == STATE_FLASH:
-            flash_fg = "#00ff00" if self.game.score > 0 else "#ff3333" if self.game.score < 0 else "#ffffff"
+        score = self.game.score
+
+        # HIDE / CATCH
+        hide_now = state in {STATE_RED, STATE_HIDDEN} or \
+                   (state == STATE_FLASH and score < 0)
+        if hide_now:
+            self._cmd_label.config(text="HIDE", fg="#ff3333")
         else:
-            flash_fg = self.PHASE_COLORS[STATE_FLASH]
-        colors = {**self.PHASE_COLORS, STATE_FLASH: flash_fg}
-        self._phase_label.config(
-            text=self.PHASE_LABELS.get(state, state),
-            fg=colors.get(state, "#555555"),
-        )
+            self._cmd_label.config(text="CATCH", fg="#00cc44")
+
+        # Phase label
+        if state == STATE_FLASH:
+            phase_fg = "#00ff00" if score > 0 else "#ff3333" if score < 0 else "#ffffff"
+        else:
+            phase_fg = self.PHASE_COLORS.get(state, "#555555")
+        self._phase_label.config(text=self.PHASE_LABELS.get(state, state), fg=phase_fg)
+
+        # Score (red when negative)
+        self._score_label.config(text=str(score),
+                                  fg="#ff4444" if score < 0 else "#00ff88")
+
         self._status_label.config(text=self.game.status_msg)
-        self._score_label.config(text=str(self.game.score))
+
+        # Phase countdown
         remaining = max(0.0, self.game.state_end_at - time.time())
         self._timer_label.config(text=f"{remaining:.1f}s" if remaining > 0 else "")
+
+        # Game time remaining + round number
+        game_left = max(0.0, self.game.game_end_at - time.time())
+        if self.game.game_end_at > 0 and state != STATE_IDLE:
+            mins, secs = divmod(int(game_left), 60)
+            self._game_timer_label.config(
+                text=f"Round {self.game.round_num}  |  Game: {mins}:{secs:02d}",
+                fg="#ff6600" if game_left < 30 else "#666666",
+            )
+        else:
+            self._game_timer_label.config(text="")
+
         self.root.after(100, self._tick)
 
-    def _on_close(self):
-        self.game.stop()
-        self.game.service.stop()
-        self.root.destroy()
+
+# ── Control window  (Start · End · Reset buttons) ─────────────────────────────
+class ControlUI:
+
+    def __init__(self, game: HideAndSeekGame, root: tk.Tk):
+        self.game = game
+        self.root = root                      # shared Tk root
+
+        self.win = tk.Toplevel(root)
+        self.win.title("Evil Eye – Controls")
+        self.win.configure(bg="#1a1a1a")
+        self.win.resizable(True, True)
+        self.win.minsize(280, 110)
+        self.win.protocol("WM_DELETE_WINDOW", self._on_end)   # X also closes app
+
+        # All 3 columns and both rows expand equally
+        for c in range(3):
+            self.win.grid_columnconfigure(c, weight=1)
+        self.win.grid_rowconfigure(0, weight=1)
+        self.win.grid_rowconfigure(1, weight=2)
+
+        tk.Label(self.win, text="CONTROLS", font=("Consolas", 12, "bold"),
+                 bg="#1a1a1a", fg="#555555", anchor="center").grid(
+            row=0, column=0, columnspan=3, sticky="nsew", pady=(16, 8))
+
+        btn_cfg = dict(font=("Consolas", 14, "bold"),
+                       relief="flat", cursor="hand2")
+
+        tk.Button(self.win, text="START",
+                  bg="#006622", fg="#ffffff", activebackground="#009933",
+                  command=self._on_start, **btn_cfg
+                  ).grid(row=1, column=0, sticky="nsew", padx=(16, 6), pady=(0, 16))
+
+        tk.Button(self.win, text="END",
+                  bg="#660000", fg="#ffffff", activebackground="#cc0000",
+                  command=self._on_end, **btn_cfg
+                  ).grid(row=1, column=1, sticky="nsew", padx=6, pady=(0, 16))
+
+        tk.Button(self.win, text="RESET",
+                  bg="#333333", fg="#cccccc", activebackground="#555555",
+                  command=self._on_reset, **btn_cfg
+                  ).grid(row=1, column=2, sticky="nsew", padx=(6, 16), pady=(0, 16))
+
+    def _on_start(self):
+        self.game.start()
+
+    def _on_end(self):
+        _shutdown(self.game, self.root)     # stops game + service + destroys all windows
+
+    def _on_reset(self):
+        self.game.reset()
+
+
+# ── Entry point helper ────────────────────────────────────────────────────────
+class GameUI:
+    """Thin wrapper that owns the Tk root and both sub-windows."""
+
+    def __init__(self, game: HideAndSeekGame):
+        self.root = tk.Tk()
+        self.display = DisplayUI(game, self.root)
+        self.control = ControlUI(game, self.root)
+        self.root.protocol("WM_DELETE_WINDOW",
+                            lambda: _shutdown(game, self.root))
 
     def run(self):
         self.root.mainloop()
