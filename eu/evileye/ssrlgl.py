@@ -30,7 +30,7 @@ INPUT_RED_MS = 1400
 INPUT_TIMEOUT_MS = 20000
 LED_REFRESH_MS = 220
 EYE_PENALTY_SECONDS = 2.5
-MAX_EYE_STRIKES = 3
+MAX_EYE_STRIKES = 2
 AUTO_NEXT_ROUND_MS = 10000
 RED_PENALTY_RESTART_MS = 2000
 
@@ -260,6 +260,8 @@ class EvilEyeGame(tk.Tk):
 		self.green_light = True
 		self.input_deadline_ts = 0.0
 		self.eye_strikes = 0
+		self.round1_grace_available = True
+		self.round1_regression_count = 0
 
 		self._last_led_states = {}
 		self._flash_leds = {}
@@ -303,6 +305,8 @@ class EvilEyeGame(tk.Tk):
 		self.green_light = True
 		self.input_deadline_ts = 0.0
 		self.eye_strikes = 0
+		self.round1_grace_available = True
+		self.round1_regression_count = 0
 		self.prev_pressed.clear()
 		self._flash_leds.clear()
 		self.round_var.set("Round: 0")
@@ -345,9 +349,18 @@ class EvilEyeGame(tk.Tk):
 
 		node = self.sequence[idx]
 		self.current_show_node = node if is_on else None
+
+		# Distractor: flash a random wrong LED briefly during the off-gap (rounds 3+)
+		if not is_on and len(self.sequence) >= 3:
+			wrong_chs = [c for c in range(1, NUM_CHANNELS + 1) if c != (node[0] if idx > 0 else 0)]
+			wrong_leds = [l for l in WALL_PATH if l != node[1]]
+			if wrong_chs and wrong_leds:
+				decoy = (random.choice(wrong_chs), random.choice(wrong_leds))
+				self._flash(decoy, (255, 100, 0), SHOW_OFF_MS / 1000.0 * 0.7)
+
 		self._render_leds()
 
-		delay = SHOW_ON_MS if is_on else SHOW_OFF_MS
+		delay = self._get_show_on_ms() if is_on else SHOW_OFF_MS
 		next_idx = idx + 1 if is_on else idx
 		next_on = not is_on
 		self._show_job = self.after(delay, lambda: self._start_show_sequence(next_idx, next_on))
@@ -356,7 +369,7 @@ class EvilEyeGame(tk.Tk):
 		self.phase = "INPUT"
 		self.input_index = 0
 		self.green_light = True
-		self.input_deadline_ts = time.time() + (INPUT_TIMEOUT_MS / 1000.0)
+		self.input_deadline_ts = time.time() + (self._get_input_timeout_ms() / 1000.0)
 		self.eye_strikes = 0
 		self.phase_var.set("Phase: Input")
 		self.status_var.set("Green light: enter sequence | Motion strikes: 0")
@@ -372,10 +385,10 @@ class EvilEyeGame(tk.Tk):
 		self.green_light = not self.green_light
 		if self.green_light:
 			self.status_var.set(f"Green light: enter sequence | Motion strikes: {self.eye_strikes}/{MAX_EYE_STRIKES}")
-			delay = INPUT_GREEN_MS
+			delay = self._get_input_green_ms()
 		else:
 			self.status_var.set(f"Red light: freeze | Motion strikes: {self.eye_strikes}/{MAX_EYE_STRIKES}")
-			delay = INPUT_RED_MS
+			delay = self._get_input_red_ms()
 
 		self._render_leds()
 		self._light_job = self.after(delay, self._schedule_light_toggle)
@@ -389,6 +402,18 @@ class EvilEyeGame(tk.Tk):
 		self._timeout_job = self.after(200, self._schedule_timeout_check)
 
 	def _round_failed(self, reason):
+		if len(self.sequence) == 1 and self.round1_grace_available:
+			self.round1_grace_available = False
+			self._cancel_round_jobs()
+			self.phase = "ROUND_OVER"
+			self.phase_var.set("Phase: Extra Chance!")
+			self.status_var.set("First fail on round 1 — extra chance! Retrying in 3s...")
+			self.log(f"Grace on round 1: {reason}. Retrying...")
+			for ch in range(1, NUM_CHANNELS + 1):
+				self._flash((ch, 0), (255, 165, 0), 1.5)
+			self._render_leds()
+			self._next_round_job = self.after(3000, self._use_grace_retry)
+			return
 		self._cancel_round_jobs()
 		self.phase = "ROUND_OVER"
 		self.phase_var.set("Phase: Round Over")
@@ -416,8 +441,14 @@ class EvilEyeGame(tk.Tk):
 
 	def _apply_red_move_penalty(self, channel, led):
 		self._cancel_round_jobs()
+		regressing_to_round1 = len(self.sequence) > 1 and len(self.sequence) - 1 == 1
 		if len(self.sequence) > 1:
 			self.sequence.pop()
+		if regressing_to_round1:
+			self.round1_regression_count += 1
+			if self.round1_regression_count >= 3:
+				self._trigger_game_over()
+				return
 		self.phase = "ROUND_OVER"
 		self.phase_var.set("Phase: Penalty")
 		self.round_var.set(f"Round: {len(self.sequence)}")
@@ -432,6 +463,25 @@ class EvilEyeGame(tk.Tk):
 		self._next_round_job = None
 		if self.phase == "ROUND_OVER" and self.sequence:
 			self._start_stage(add_step=False)
+
+	def _use_grace_retry(self):
+		self._next_round_job = None
+		if self.phase == "ROUND_OVER":
+			self.log("Retrying round 1 (grace).")
+			self._start_stage(add_step=False)
+
+	def _trigger_game_over(self):
+		self._cancel_round_jobs()
+		if self._next_round_job is not None:
+			self.after_cancel(self._next_round_job)
+			self._next_round_job = None
+		self.phase = "GAME_OVER"
+		self.phase_var.set("Phase: GAME OVER")
+		self.status_var.set("GAME OVER — Press Reset to play again")
+		self.log("GAME OVER! Returned to round 1 too many times.")
+		for ch in range(1, NUM_CHANNELS + 1):
+			self._flash((ch, 0), (255, 0, 0), 10.0)
+		self._render_leds()
 
 	def _cancel_round_jobs(self):
 		if self._show_job is not None:
@@ -453,6 +503,23 @@ class EvilEyeGame(tk.Tk):
 			self.after_cancel(self._next_round_job)
 			self._next_round_job = None
 
+	# --- Difficulty scaling ---
+	def _get_show_on_ms(self):
+		"""Show time per node shrinks from 700ms → 300ms over 10 rounds."""
+		return max(300, SHOW_ON_MS - (len(self.sequence) - 1) * 40)
+
+	def _get_input_green_ms(self):
+		"""Green-light window shrinks from 2300ms → 1100ms over 10 rounds."""
+		return max(1100, INPUT_GREEN_MS - (len(self.sequence) - 1) * 120)
+
+	def _get_input_red_ms(self):
+		"""Red-light freeze grows from 1400ms → 2400ms over 10 rounds."""
+		return min(2400, INPUT_RED_MS + (len(self.sequence) - 1) * 100)
+
+	def _get_input_timeout_ms(self):
+		"""Total input budget shrinks from 20s → 10s over 10 rounds."""
+		return max(10000, INPUT_TIMEOUT_MS - (len(self.sequence) - 1) * 1000)
+
 	def _flash(self, node, color, sec):
 		self._flash_leds[node] = (color, time.time() + sec)
 
@@ -463,6 +530,8 @@ class EvilEyeGame(tk.Tk):
 			return (0, 255, 0) if self.green_light else (255, 0, 0)
 		if self.phase == "ROUND_OVER":
 			return (120, 120, 120)
+		if self.phase == "GAME_OVER":
+			return (255, 0, 0)
 		return (0, 0, 120)
 
 	def _render_leds(self):
