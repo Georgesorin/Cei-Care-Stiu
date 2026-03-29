@@ -115,6 +115,8 @@ class ScoreWindow:
 
         self.winner_lbl = ttk.Label(container, text="Winner: -", style=f"{self.style_prefix}.Small.TLabel")
         self.winner_lbl.pack(pady=(14, 0))
+        self.state_lbl = ttk.Label(container, text="State: PRELOBBY", style=f"{self.style_prefix}.Small.TLabel")
+        self.state_lbl.pack(pady=(6, 0))
 
         self._last_payload = None
         self.root.update_idletasks()
@@ -158,11 +160,13 @@ class ScoreWindow:
                 right = int(payload.get("right", 0))
                 winner = payload.get("winner")
                 song = payload.get("song") or "-"
+                state = payload.get("state") or "-"
 
                 self.left_score_lbl.configure(text=str(left))
                 self.right_score_lbl.configure(text=str(right))
                 self.song_lbl.configure(text=f"Melodie: {song}")
                 self.winner_lbl.configure(text=f"Winner: {winner if winner else '-'}")
+                self.state_lbl.configure(text=f"State: {state}")
                 self._last_payload = payload
 
         self.root.after(120, self._poll_scores)

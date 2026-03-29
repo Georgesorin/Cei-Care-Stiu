@@ -21,6 +21,11 @@ DEBUG_INPUT = 1  # 1 = print input/trigger debug logs
 FRAME_DATA_LEN = LEDS_PER_CHANNEL * NUM_CHANNELS * 3
 TRIGGER_PACKET_LEN = 687
 
+# Real hardware can have different channel wiring than simulator.
+# Simulator uses logical RGB; real room can be configured (e.g. GRB).
+REAL_ROOM_COLOR_ORDER = "GRB"
+OUTPUT_COLOR_ORDER = "RGB"
+
 # Real hardware ports (used when a device is discovered on the LAN)
 DEVICE_SEND_PORT = 4626    # Send light commands to device
 DEVICE_RECV_PORT = 7800    # Receive button events from device
@@ -172,9 +177,24 @@ def build_fff0_packet(seq):
 	return build_command_packet(0x8877, 0xFFF0, bytes(payload), seq)
 
 
+def map_output_color(r, g, b):
+	if OUTPUT_COLOR_ORDER == "GRB":
+		return g, r, b
+	if OUTPUT_COLOR_ORDER == "RBG":
+		return r, b, g
+	if OUTPUT_COLOR_ORDER == "BRG":
+		return b, r, g
+	if OUTPUT_COLOR_ORDER == "BGR":
+		return b, g, r
+	if OUTPUT_COLOR_ORDER == "GBR":
+		return g, b, r
+	return r, g, b
+
+
 def build_frame_data(led_states):
 	frame = bytearray(FRAME_DATA_LEN)
 	for (ch, led), (r, g, b) in led_states.items():
+		r, g, b = map_output_color(r, g, b)
 		ch_idx = ch - 1
 		if 0 <= ch_idx < NUM_CHANNELS and 0 <= led < LEDS_PER_CHANNEL:
 			frame[led * 12 + ch_idx] = g
@@ -1113,6 +1133,12 @@ if __name__ == "__main__":
 	try:
 		print("[Discovery] Scanning LAN for Evil Eye hardware...")
 		device_ip, send_port, recv_port = run_discovery()
+		is_real_target = (send_port == DEVICE_SEND_PORT and recv_port == DEVICE_RECV_PORT)
+		OUTPUT_COLOR_ORDER = REAL_ROOM_COLOR_ORDER if is_real_target else "RGB"
+		if is_real_target:
+			print(f"[Compat] Real-room color order active: {OUTPUT_COLOR_ORDER}")
+		else:
+			print(f"[Compat] Simulator/default color mapping active: {OUTPUT_COLOR_ORDER}")
 		print(f"[Discovery] Connecting to {device_ip}:{send_port} (recv:{recv_port})")
 		game = GamblerFugitiveGame(device_ip, send_port, recv_port)
 		game.mainloop()
