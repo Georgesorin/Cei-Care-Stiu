@@ -3,6 +3,11 @@ import threading
 import random
 import time
 import ctypes
+import os
+import winsound
+import io
+import wave
+import audioop
 import tkinter as tk
 from tkinter import ttk
 
@@ -331,6 +336,9 @@ class EvilEyeGame(tk.Tk):
 		self._next_round_job = None
 		self._tv_window = None
 		self._tv_text_var = tk.StringVar(value="Welcome. Press Start Round.")
+		self._sound_gain = 0.8
+		self._sound_paths = self._resolve_sound_paths()
+		self._sound_buffers = self._build_quieter_sound_buffers()
 
 		self._build_ui()
 		self._build_tv_ui()
@@ -341,6 +349,128 @@ class EvilEyeGame(tk.Tk):
 		self.round_var.trace_add("write", lambda *_args: self._update_tv_text())
 		self._schedule_led_refresh()
 		self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+	def _resolve_sound_paths(self):
+		base_dir = os.path.dirname(os.path.abspath(__file__))
+		parent_dir = os.path.dirname(base_dir)
+		start_candidates = [
+			os.path.join(base_dir, "start.wav"),
+			os.path.join(parent_dir, "start.wav"),
+		]
+		end_candidates = [
+			os.path.join(base_dir, "end.wav"),
+			os.path.join(parent_dir, "end.wav"),
+		]
+		beep_candidates = [
+			os.path.join(base_dir, "beep.wav"),
+			os.path.join(parent_dir, "beep.wav"),
+		]
+
+		start_path = next((p for p in start_candidates if os.path.exists(p)), None)
+		end_path = next((p for p in end_candidates if os.path.exists(p)), None)
+		beep_path = next((p for p in beep_candidates if os.path.exists(p)), None)
+		return {"start": start_path, "end": end_path, "beep": beep_path}
+
+	def _attenuate_wav_bytes(self, wav_path, gain):
+		"""Return a quieter WAV byte stream. Falls back to original file bytes if needed."""
+		try:
+			with wave.open(wav_path, "rb") as src:
+				params = src.getparams()
+				raw = src.readframes(src.getnframes())
+				sample_width = src.getsampwidth()
+
+			quiet_raw = audioop.mul(raw, sample_width, gain)
+
+			buf = io.BytesIO()
+			with wave.open(buf, "wb") as dst:
+				dst.setparams(params)
+				dst.writeframes(quiet_raw)
+			return buf.getvalue()
+		except Exception:
+			try:
+				with open(wav_path, "rb") as f:
+					return f.read()
+			except Exception:
+				return None
+
+	def _build_quieter_sound_buffers(self):
+		buffers = {}
+		for cue_name, path in self._sound_paths.items():
+			if cue_name == "beep":
+				continue
+			if not path:
+				buffers[cue_name] = None
+				continue
+			buffers[cue_name] = self._attenuate_wav_bytes(path, self._sound_gain)
+		return buffers
+
+	def _pitch_factor_for_round(self):
+		"""Increase beep pitch as rounds increase, with a safe upper cap."""
+		return min(1.9, 1.0 + max(0, len(self.sequence) - 1) * 0.07)
+
+	def _build_pitched_beep_bytes(self, pitch_factor):
+		path = self._sound_paths.get("beep")
+		if not path:
+			return None
+		try:
+			with wave.open(path, "rb") as src:
+				params = src.getparams()
+				raw = src.readframes(src.getnframes())
+				new_rate = int(max(8000, min(192000, params.framerate * pitch_factor)))
+
+			buf = io.BytesIO()
+			with wave.open(buf, "wb") as dst:
+				dst.setnchannels(params.nchannels)
+				dst.setsampwidth(params.sampwidth)
+				dst.setframerate(new_rate)
+				dst.writeframes(raw)
+			return buf.getvalue()
+		except Exception:
+			return None
+
+	def _play_beep_for_round(self):
+		path = self._sound_paths.get("beep")
+		if not path:
+			return
+
+		if not hasattr(self, "_beep_cache"):
+			self._beep_cache = {}
+
+		factor = self._pitch_factor_for_round()
+		cache_key = int(factor * 100)
+		wav_bytes = self._beep_cache.get(cache_key)
+		if wav_bytes is None:
+			wav_bytes = self._build_pitched_beep_bytes(factor)
+			self._beep_cache[cache_key] = wav_bytes
+
+		if wav_bytes:
+			try:
+				winsound.PlaySound(wav_bytes, winsound.SND_MEMORY | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+				return
+			except Exception:
+				pass
+
+		try:
+			winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+		except Exception:
+			pass
+
+	def _play_cue(self, cue_name):
+		wav_bytes = self._sound_buffers.get(cue_name)
+		path = self._sound_paths.get(cue_name)
+
+		if wav_bytes:
+			try:
+				winsound.PlaySound(wav_bytes, winsound.SND_MEMORY | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+				return
+			except Exception:
+				pass
+
+		if path:
+			try:
+				winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+			except Exception:
+				pass
 
 	def _build_ui(self):
 		top = tk.Frame(self, bg="#1f1f1f")
@@ -526,9 +656,11 @@ class EvilEyeGame(tk.Tk):
 
 		self.green_light = not self.green_light
 		if self.green_light:
+			self._play_cue("end")
 			self.status_var.set(f"Green light: enter sequence | Motion strikes: {self.eye_strikes}/{MAX_EYE_STRIKES}")
 			delay = self._get_input_green_ms()
 		else:
+			self._play_cue("start")
 			self.status_var.set(f"Red light: freeze | Motion strikes: {self.eye_strikes}/{MAX_EYE_STRIKES}")
 			delay = self._get_input_red_ms()
 		self._last_light_toggle_ts = time.time()
@@ -570,7 +702,7 @@ class EvilEyeGame(tk.Tk):
 		self._cancel_round_jobs()
 		self.phase = "ROUND_OVER"
 		self.phase_var.set("Phase: Round Over")
-		self.status_var.set("Success! Next round starts in 10s")
+		self.status_var.set("Success! Next round starts in 5s")
 		self.log("Round complete.")
 		for ch in range(1, NUM_CHANNELS + 1):
 			self._flash((ch, EYE_LED_INDEX), (0, 255, 80), 1.0)
@@ -735,6 +867,8 @@ class EvilEyeGame(tk.Tk):
 			self._last_press_ts = now
 			self._apply_motion_penalty(channel)
 			return
+
+		self._play_beep_for_round()
 
 		if not self.green_light:
 			if (now - self._last_light_toggle_ts) < (RED_LIGHT_GRACE_MS / 1000.0):
