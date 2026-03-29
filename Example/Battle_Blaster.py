@@ -1711,6 +1711,19 @@ def game_thread_func(game):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    # DPI awareness on Windows so monitor coordinates are correct
+    try:
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        pass
+
+    try:
+        import screeninfo
+        SCREENINFO_OK = True
+    except ImportError:
+        SCREENINFO_OK = False
+
     game = BattleGame()
     net  = NetworkManager(game)
     net.start_bg()
@@ -1719,7 +1732,7 @@ if __name__ == "__main__":
     gt.daemon = True
     gt.start()
 
-    # ── tkinter UI ────────────────────────────────────────────────────────────
+    # ── Shared style constants ────────────────────────────────────────────────
     BG        = "#0a0a0a"
     BG_CARD   = "#141414"
     RED_HEX   = "#ff2222"
@@ -1729,79 +1742,6 @@ if __name__ == "__main__":
     BTN_BG    = "#1e1e1e"
     BTN_HO    = "#2e2e2e"
 
-    root = tk.Tk()
-    root.title("Battle Blaster — Control")
-    root.configure(bg=BG)
-    root.resizable(False, False)
-
-    # ── Control window content ────────────────────────────────────────────────
-    tk.Label(root, text="⚡ BATTLE BLASTER", bg=BG,
-             fg=WHITE_HEX, font=("Consolas", 18, "bold")).pack(pady=(18, 4))
-
-    state_var = tk.StringVar(value="● LOBBY")
-    state_lbl = tk.Label(root, textvariable=state_var, bg=BG,
-                         fg=DIM_HEX, font=("Consolas", 11))
-    state_lbl.pack(pady=(0, 16))
-
-    def make_btn(parent, text, cmd, fg=WHITE_HEX):
-        btn = tk.Button(parent, text=text, command=cmd,
-                        bg=BTN_BG, fg=fg, activebackground=BTN_HO,
-                        activeforeground=fg, relief="flat",
-                        font=("Consolas", 13, "bold"),
-                        width=20, pady=8, cursor="hand2")
-        btn.pack(pady=5, padx=30)
-        btn.bind("<Enter>", lambda e: btn.configure(bg=BTN_HO))
-        btn.bind("<Leave>", lambda e: btn.configure(bg=BTN_BG))
-        return btn
-
-    make_btn(root, "▶  START GAME",    lambda: game.start_game(),    fg="#44ff88")
-    make_btn(root, "↺  RESTART ROUND", lambda: game.restart_round(), fg="#ffcc00")
-    make_btn(root, "✕  QUIT",          lambda: os._exit(0),           fg="#ff4444")
-
-    tk.Label(root, text="", bg=BG).pack(pady=6)
-
-    # ── Scoreboard window ─────────────────────────────────────────────────────
-    board = tk.Toplevel(root)
-    board.title("Battle Blaster — Scoreboard")
-    board.configure(bg=BG)
-    board.resizable(True, True)
-
-    # Position scoreboard to the right of the control window
-    root.update_idletasks()
-    cx = root.winfo_x() + root.winfo_width() + 12
-    cy = root.winfo_y()
-    board.geometry(f"+{cx}+{cy}")
-
-    tk.Label(board, text="SCOREBOARD", bg=BG,
-             fg=DIM_HEX, font=("Consolas", 11, "bold")).pack(pady=(16, 8))
-
-    # ── Team A ────────────────────────────────────────────────────────────────
-    frame_a = tk.Frame(board, bg=BG_CARD, bd=0)
-    frame_a.pack(fill="x", padx=24, pady=6)
-    tk.Label(frame_a, text="  TEAM A  ", bg=BG_CARD,
-             fg=RED_HEX, font=("Consolas", 13, "bold")).pack(side="left", padx=10, pady=10)
-    score_a_var = tk.StringVar(value="0")
-    tk.Label(frame_a, textvariable=score_a_var, bg=BG_CARD,
-             fg=RED_HEX, font=("Consolas", 36, "bold"), width=4).pack(side="right", padx=10)
-
-    # ── Team B ────────────────────────────────────────────────────────────────
-    frame_b = tk.Frame(board, bg=BG_CARD, bd=0)
-    frame_b.pack(fill="x", padx=24, pady=6)
-    tk.Label(frame_b, text="  TEAM B  ", bg=BG_CARD,
-             fg=BLUE_HEX, font=("Consolas", 13, "bold")).pack(side="left", padx=10, pady=10)
-    score_b_var = tk.StringVar(value="0")
-    tk.Label(frame_b, textvariable=score_b_var, bg=BG_CARD,
-             fg=BLUE_HEX, font=("Consolas", 36, "bold"), width=4).pack(side="right", padx=10)
-
-    # ── Timer ─────────────────────────────────────────────────────────────────
-    tk.Label(board, text="TIME REMAINING", bg=BG,
-             fg=DIM_HEX, font=("Consolas", 10)).pack(pady=(14, 2))
-    timer_var = tk.StringVar(value="--:--")
-    timer_lbl = tk.Label(board, textvariable=timer_var, bg=BG,
-                         fg=WHITE_HEX, font=("Consolas", 48, "bold"))
-    timer_lbl.pack(pady=(0, 18))
-
-    # ── Periodic refresh ──────────────────────────────────────────────────────
     STATE_COLORS = {
         'LOBBY':    DIM_HEX,
         'STARTUP':  "#ffcc00",
@@ -1809,33 +1749,148 @@ if __name__ == "__main__":
         'GAMEOVER': "#ff4444",
     }
 
-    def refresh():
-        # State label + color
-        st = game.state
-        state_var.set(f"● {st}")
-        state_lbl.configure(fg=STATE_COLORS.get(st, DIM_HEX))
+    # ── Helper: build control window on a given tk parent/toplevel ────────────
+    def build_control(win):
+        win.title("Battle Blaster — Control")
+        win.configure(bg=BG)
+        win.resizable(False, False)
 
-        # Scores
-        score_a_var.set(str(game.teams['A'].score))
-        score_b_var.set(str(game.teams['B'].score))
+        tk.Label(win, text="⚡ BATTLE BLASTER", bg=BG,
+                 fg=WHITE_HEX, font=("Consolas", 18, "bold")).pack(pady=(18, 4))
 
-        # Timer
-        if st == 'PLAYING':
-            elapsed   = time.time() - game.game_start_time
-            remaining = max(0.0, GAME_DURATION - elapsed)
-            mins  = int(remaining) // 60
-            secs  = int(remaining) % 60
-            timer_var.set(f"{mins:02d}:{secs:02d}")
-            # Turn red when under 30 s
-            timer_lbl.configure(fg="#ff4444" if remaining < 30 else WHITE_HEX)
-        elif st == 'GAMEOVER':
-            timer_var.set("00:00")
-            timer_lbl.configure(fg="#ff4444")
+        sv = tk.StringVar(value="● LOBBY")
+        sl = tk.Label(win, textvariable=sv, bg=BG,
+                      fg=DIM_HEX, font=("Consolas", 11))
+        sl.pack(pady=(0, 16))
+
+        def make_btn(text, cmd, fg=WHITE_HEX):
+            btn = tk.Button(win, text=text, command=cmd,
+                            bg=BTN_BG, fg=fg, activebackground=BTN_HO,
+                            activeforeground=fg, relief="flat",
+                            font=("Consolas", 13, "bold"),
+                            width=20, pady=8, cursor="hand2")
+            btn.pack(pady=5, padx=30)
+            btn.bind("<Enter>", lambda e: btn.configure(bg=BTN_HO))
+            btn.bind("<Leave>", lambda e: btn.configure(bg=BTN_BG))
+
+        make_btn("▶  START GAME",    lambda: game.start_game(),    fg="#44ff88")
+        make_btn("↺  RESTART ROUND", lambda: game.restart_round(), fg="#ffcc00")
+        make_btn("✕  QUIT",          lambda: os._exit(0),           fg="#ff4444")
+        tk.Label(win, text="", bg=BG).pack(pady=6)
+
+        return sv, sl   # so refresh() can update them
+
+    # ── Helper: build scoreboard window on a given tk parent/toplevel ─────────
+    def build_scoreboard(win):
+        win.title("Battle Blaster — Scoreboard")
+        win.configure(bg=BG)
+        win.resizable(True, True)
+
+        tk.Label(win, text="SCOREBOARD", bg=BG,
+                 fg=DIM_HEX, font=("Consolas", 11, "bold")).pack(pady=(16, 8))
+
+        fa = tk.Frame(win, bg=BG_CARD)
+        fa.pack(fill="x", padx=24, pady=6)
+        tk.Label(fa, text="  TEAM A  ", bg=BG_CARD,
+                 fg=RED_HEX, font=("Consolas", 13, "bold")).pack(side="left", padx=10, pady=10)
+        sa_var = tk.StringVar(value="0")
+        tk.Label(fa, textvariable=sa_var, bg=BG_CARD,
+                 fg=RED_HEX, font=("Consolas", 36, "bold"), width=4).pack(side="right", padx=10)
+
+        fb = tk.Frame(win, bg=BG_CARD)
+        fb.pack(fill="x", padx=24, pady=6)
+        tk.Label(fb, text="  TEAM B  ", bg=BG_CARD,
+                 fg=BLUE_HEX, font=("Consolas", 13, "bold")).pack(side="left", padx=10, pady=10)
+        sb_var = tk.StringVar(value="0")
+        tk.Label(fb, textvariable=sb_var, bg=BG_CARD,
+                 fg=BLUE_HEX, font=("Consolas", 36, "bold"), width=4).pack(side="right", padx=10)
+
+        tk.Label(win, text="TIME REMAINING", bg=BG,
+                 fg=DIM_HEX, font=("Consolas", 10)).pack(pady=(14, 2))
+        t_var = tk.StringVar(value="--:--")
+        t_lbl = tk.Label(win, textvariable=t_var, bg=BG,
+                         fg=WHITE_HEX, font=("Consolas", 48, "bold"))
+        t_lbl.pack(pady=(0, 18))
+
+        return sa_var, sb_var, t_var, t_lbl
+
+    # ── Open the two windows ──────────────────────────────────────────────────
+    def open_main_windows(ctrl_mon, board_mon):
+        root = tk.Tk()
+
+        # Place control window
+        if ctrl_mon:
+            root.geometry(f"+{ctrl_mon.x}+{ctrl_mon.y}")
+
+        state_var, state_lbl = build_control(root)
+
+        # Place scoreboard window
+        board = tk.Toplevel(root)
+        if board_mon:
+            board.geometry(
+                f"{board_mon.width}x{board_mon.height}+{board_mon.x}+{board_mon.y}")
+            board.overrideredirect(True)   # fullscreen borderless on chosen monitor
+            board.bind("<Escape>", lambda e: board.destroy())
         else:
-            timer_var.set("--:--")
-            timer_lbl.configure(fg=DIM_HEX)
+            root.update_idletasks()
+            cx = root.winfo_x() + root.winfo_width() + 12
+            cy = root.winfo_y()
+            board.geometry(f"+{cx}+{cy}")
 
-        root.after(200, refresh)   # refresh every 200 ms
+        sa_var, sb_var, t_var, t_lbl = build_scoreboard(board)
 
-    refresh()
-    root.mainloop()
+        def refresh():
+            st = game.state
+            state_var.set(f"● {st}")
+            state_lbl.configure(fg=STATE_COLORS.get(st, DIM_HEX))
+
+            sa_var.set(str(game.teams['A'].score))
+            sb_var.set(str(game.teams['B'].score))
+
+            if st == 'PLAYING':
+                elapsed   = time.time() - game.game_start_time
+                remaining = max(0.0, GAME_DURATION - elapsed)
+                mins = int(remaining) // 60
+                secs = int(remaining) % 60
+                t_var.set(f"{mins:02d}:{secs:02d}")
+                t_lbl.configure(fg="#ff4444" if remaining < 30 else WHITE_HEX)
+            elif st == 'GAMEOVER':
+                t_var.set("00:00")
+                t_lbl.configure(fg="#ff4444")
+            else:
+                t_var.set("--:--")
+                t_lbl.configure(fg=DIM_HEX)
+
+            root.after(200, refresh)
+
+        refresh()
+        root.mainloop()
+
+    # ── Auto-detect monitors and launch directly ──────────────────────────────
+    ctrl_mon  = None
+    board_mon = None
+
+    if SCREENINFO_OK:
+        try:
+            monitors = screeninfo.get_monitors()
+            if len(monitors) >= 2:
+                # Primary monitor → control panel
+                ctrl_mon = next(
+                    (m for m in monitors if getattr(m, 'is_primary', False)),
+                    monitors[0]
+                )
+                # First non-primary → scoreboard fullscreen
+                board_mon = next(
+                    (m for m in monitors if m is not ctrl_mon),
+                    None
+                )
+                print(f"Control panel  → {getattr(ctrl_mon,  'name', '?')} "
+                      f"({ctrl_mon.width}x{ctrl_mon.height})")
+                print(f"Scoreboard     → {getattr(board_mon, 'name', '?')} "
+                      f"({board_mon.width}x{board_mon.height})")
+            else:
+                print("Only one monitor detected — both windows on primary screen.")
+        except Exception as e:
+            print(f"Monitor detection failed ({e}) — single screen fallback.")
+
+    open_main_windows(ctrl_mon, board_mon)

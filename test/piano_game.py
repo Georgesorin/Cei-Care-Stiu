@@ -1202,7 +1202,7 @@ class PianoGame:
         self.board = [[BLACK for _ in range(BOARD_WIDTH)] for _ in range(BOARD_HEIGHT)]
 
         self.running = True
-        self.state = 'LOBBY' # LOBBY, SIDE_SELECT, COUNTDOWN, PLAYING, GAMEOVER
+        self.state = 'PRELOBBY' # PRELOBBY, LOBBY, SIDE_SELECT, COUNTDOWN, PLAYING, GAMEOVER
         self.startup_step = 0
         self.startup_timer = time.time()
         self.countdown_start_time = None
@@ -1244,6 +1244,7 @@ class PianoGame:
         self.side_select_start_time = None
         self.SIDE_SELECT_DURATION = 4.0  # seconds (2s longer)
         self.active_piano_sides = {'left': True, 'right': True}
+        self.PRELOBBY_START_RECT = (6, 16, 9, 19)  # x0, y0, x1, y1
         self.selected_difficulty = None
         self.scoreboard_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "team_scores.json")
         self._publish_scores()
@@ -1522,6 +1523,87 @@ class PianoGame:
                 right += 1
         return left, right
 
+    def _is_prelobby_start_pressed(self):
+        """Return True if any pressed touch is inside the central START area."""
+        x0, y0, x1, y1 = self.PRELOBBY_START_RECT
+        for idx, pressed in enumerate(self.button_states):
+            if not pressed:
+                continue
+            x, y = self._button_index_to_xy(idx)
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                return True
+        return False
+
+    def _render_prelobby(self, frame_buffer):
+        """Render PRELOBBY with central START gate and blue ground fade animation."""
+        # Dark sky background.
+        for y in range(BOARD_HEIGHT):
+            for x in range(BOARD_WIDTH):
+                self.set_led(frame_buffer, x, y, (2, 6, 20))
+
+        # Blue fade animation on the ground.
+        ground_pulse = 0.25 + 0.75 * (0.5 + 0.5 * math.sin(self.time_counter * 0.14))
+        ground_color = (
+            int(8 * ground_pulse),
+            int(34 * ground_pulse),
+            int(165 * ground_pulse),
+        )
+        for y in range(BOARD_HEIGHT - 6, BOARD_HEIGHT):
+            for x in range(BOARD_WIDTH):
+                self.set_led(frame_buffer, x, y, ground_color)
+
+        # START word (3x5 letters, no spacing => width 15, centered).
+        glyphs = {
+            'S': [
+                [1, 1, 1],
+                [1, 0, 0],
+                [1, 1, 1],
+                [0, 0, 1],
+                [1, 1, 1],
+            ],
+            'T': [
+                [1, 1, 1],
+                [0, 1, 0],
+                [0, 1, 0],
+                [0, 1, 0],
+                [0, 1, 0],
+            ],
+            'A': [
+                [1, 1, 1],
+                [1, 0, 1],
+                [1, 1, 1],
+                [1, 0, 1],
+                [1, 0, 1],
+            ],
+            'R': [
+                [1, 1, 1],
+                [1, 0, 1],
+                [1, 1, 1],
+                [1, 1, 0],
+                [1, 0, 1],
+            ],
+        }
+        start_text = "START"
+        text_width = len(start_text) * 3
+        start_x = max(0, (BOARD_WIDTH - text_width) // 2)
+        start_y = 8
+        for i, ch in enumerate(start_text):
+            glyph = glyphs[ch]
+            gx0 = start_x + i * 3
+            for gy, row in enumerate(glyph):
+                for gx, bit in enumerate(row):
+                    if bit:
+                        self.set_led(frame_buffer, gx0 + gx, start_y + gy, WHITE)
+
+        # Central START touch area (button-like panel).
+        x0, y0, x1, y1 = self.PRELOBBY_START_RECT
+        button_pulse = 0.35 + 0.65 * (0.5 + 0.5 * math.sin(self.time_counter * 0.20))
+        fill = (0, int(100 * button_pulse), int(220 * button_pulse))
+        for y in range(y0, y1 + 1):
+            for x in range(x0, x1 + 1):
+                border = (x == x0 or x == x1 or y == y0 or y == y1)
+                self.set_led(frame_buffer, x, y, WHITE if border else fill)
+
 
 
 
@@ -1669,6 +1751,12 @@ class PianoGame:
 
         if not hasattr(self, 'time_counter'):
             self.time_counter = 0
+
+        if self.state == 'PRELOBBY':
+            self._render_prelobby(frame_buffer)
+            self.time_counter += 1
+            self.prev_button_states = self.button_states.copy()
+            return frame_buffer
 
         if self.state == 'LOBBY':
             self._render_lobby(frame_buffer)
@@ -1833,6 +1921,14 @@ class PianoGame:
 
     def tick(self):
         with self.lock:
+            if self.state == 'PRELOBBY':
+                if self._is_prelobby_start_pressed():
+                    self.state = 'LOBBY'
+                    self.lobby_start_time = time.time()
+                    self._publish_scores()
+                    print("PRELOBBY -> LOBBY (START pressed)", flush=True)
+                return
+
             if self.state == 'LOBBY':
                 # Check if timer has expired — snapshot current button state
                 elapsed = time.time() - self.lobby_start_time
