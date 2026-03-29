@@ -45,8 +45,8 @@ def _load_config():
     # eye_ctrl_config.json naming (from hardware perspective):
     #   "udp_port"       = port where hardware SENDS button events  → we LISTEN here
     #   "receiver_port"  = port where hardware RECEIVES light data  → we SEND here
-    defaults = {"device_ip": "255.255.255.255", "udp_port": 9998,
-                "receiver_port": 9999, "polling_rate_ms": 100}
+    defaults = {"device_ip": "169.254.182.11", "udp_port": 4626,
+                "receiver_port": 7800, "polling_rate_ms": 100}
     try:
         with open(_CFG_PATH, encoding="utf-8") as f:
             defaults.update(json.load(f))
