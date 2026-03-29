@@ -14,8 +14,13 @@ RECV_PORT = 7272  # From simulator (button events)
 FRAME_DATA_LEN = LEDS_PER_CHANNEL * NUM_CHANNELS * 3
 TRIGGER_PACKET_LEN = 687
 
+# Real hardware ports (used when a device is discovered on the LAN)
+DEVICE_SEND_PORT = 4626    # Send light commands to device
+DEVICE_RECV_PORT = 7800    # Receive button events from device
+DISCOVERY_TIMEOUT_SEC = 3  # How long to wait for a hardware response
+
 # Playable buttons based on your wall layout.
-WALL_PATH = [1, 3, 5, 6, 8, 10]
+WALL_PATH = list(range(1, 11))
 
 # Timings (milliseconds)
 SHOW_ON_MS = 700
@@ -26,6 +31,8 @@ INPUT_TIMEOUT_MS = 20000
 LED_REFRESH_MS = 220
 EYE_PENALTY_SECONDS = 2.5
 MAX_EYE_STRIKES = 3
+AUTO_NEXT_ROUND_MS = 10000
+RED_PENALTY_RESTART_MS = 2000
 
 PASSWORD_ARRAY = [
 	35, 63, 187, 69, 107, 178, 92, 76, 39, 69, 205, 37, 223, 255, 165, 231,
@@ -128,13 +135,80 @@ def build_frame_data(led_states):
 			frame[led * 12 + 8 + ch_idx] = b
 	return bytes(frame)
 
+# --- Hardware Discovery ---
+def build_discovery_packet():
+	"""Build the 0x67 broadcast discovery packet."""
+	rand1 = random.randint(0, 127)
+	rand2 = random.randint(0, 127)
+	payload = bytes([
+		0x0A, 0x02, 0x4B, 0x58, 0x2D, 0x48, 0x43, 0x30, 0x34, 0x03,
+		0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x14,
+	])
+	pkt = bytearray([0x67, rand1, rand2, len(payload)] + list(payload))
+	idx = sum(pkt) & 0xFF
+	pkt.append(PASSWORD_ARRAY[idx] if idx < len(PASSWORD_ARRAY) else 0)
+	return bytes(pkt), rand1, rand2
+
+
+def run_discovery():
+	"""
+	Broadcasts a discovery packet on the LAN.
+	Returns (device_ip, send_port, recv_port).
+	Falls back to the simulator (127.0.0.1) if no real hardware responds.
+	"""
+	pkt, rand1, rand2 = build_discovery_packet()
+	sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+	sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, True)
+	sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, True)
+	sock.settimeout(0.5)
+
+	try:
+		sock.bind(('', DEVICE_RECV_PORT))
+	except OSError:
+		sock.close()
+		print("[Discovery] Could not bind recv port — using simulator fallback.")
+		return SIMULATOR_IP, SEND_PORT, RECV_PORT
+
+	try:
+		sock.sendto(pkt, ('255.255.255.255', DEVICE_SEND_PORT))
+		print(f"[Discovery] Sent broadcast to 255.255.255.255:{DEVICE_SEND_PORT}")
+	except OSError as e:
+		sock.close()
+		print(f"[Discovery] Broadcast failed: {e} — using simulator fallback.")
+		return SIMULATOR_IP, SEND_PORT, RECV_PORT
+
+	found_ip = None
+	deadline = time.time() + DISCOVERY_TIMEOUT_SEC
+	while time.time() < deadline:
+		try:
+			data, addr = sock.recvfrom(256)
+			if len(data) >= 30 and data[0] == 0x68 and data[1] == rand1 and data[2] == rand2:
+				found_ip = addr[0]
+				model = data[6:13].rstrip(b'\x00').decode('ascii', errors='replace')
+				print(f"[Discovery] Found device '{model}' at {found_ip}")
+				break
+		except socket.timeout:
+			continue
+		except OSError:
+			break
+
+	sock.close()
+
+	if found_ip:
+		return found_ip, DEVICE_SEND_PORT, DEVICE_RECV_PORT
+	print("[Discovery] No hardware found — using simulator fallback.")
+	return SIMULATOR_IP, SEND_PORT, RECV_PORT
+
+
 # --- UDP Communication ---
 class EvilEyeComm:
-	def __init__(self, recv_callback):
+	def __init__(self, recv_callback, device_ip, send_port, recv_port):
+		self.device_ip = device_ip
+		self.send_port = send_port
 		self.send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 		self.recv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 		self.recv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-		self.recv_sock.bind(("", RECV_PORT))
+		self.recv_sock.bind(("", recv_port))
 		self.recv_callback = recv_callback
 		self.running = True
 		self.seq = 0
@@ -142,7 +216,7 @@ class EvilEyeComm:
 
 	def send_led_frame(self, led_states):
 		frame = build_frame_data(led_states)
-		ep = (SIMULATOR_IP, SEND_PORT)
+		ep = (self.device_ip, self.send_port)
 		self.seq = (self.seq + 1) & 0xFFFF
 		self.send_sock.sendto(build_start_packet(self.seq), ep)
 		time.sleep(0.008)
@@ -167,12 +241,13 @@ class EvilEyeComm:
 
 # --- Game Logic ---
 class EvilEyeGame(tk.Tk):
-	def __init__(self):
+	def __init__(self, device_ip, send_port, recv_port):
 		super().__init__()
 		self.title("Evil Eye - Memory x Red Light / Green Light")
 		self.geometry("860x520")
 
-		self.comm = EvilEyeComm(self.on_button_event)
+		self.comm = EvilEyeComm(self.on_button_event, device_ip, send_port, recv_port)
+		self._device_label = f"{device_ip}:{send_port}"
 		self.status_var = tk.StringVar(value="Press Start Round")
 		self.round_var = tk.StringVar(value="Round: 0")
 		self.phase_var = tk.StringVar(value="Phase: Idle")
@@ -193,6 +268,7 @@ class EvilEyeGame(tk.Tk):
 		self._light_job = None
 		self._timeout_job = None
 		self._refresh_job = None
+		self._next_round_job = None
 
 		self._build_ui()
 		self._schedule_led_refresh()
@@ -207,6 +283,7 @@ class EvilEyeGame(tk.Tk):
 		tk.Label(top, textvariable=self.round_var, bg="#1f1f1f", fg="#d8d8d8").pack(side=tk.LEFT, padx=14)
 		tk.Label(top, textvariable=self.phase_var).pack(side=tk.LEFT, padx=14)
 		tk.Label(top, textvariable=self.status_var).pack(side=tk.LEFT, padx=14)
+		tk.Label(top, text=f"Device: {self._device_label}", bg="#1f1f1f", fg="#888").pack(side=tk.RIGHT, padx=10)
 
 		self.log_text = tk.Text(self, height=20, state="disabled", bg="#111", fg="#00ff8c")
 		self.log_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
@@ -237,10 +314,16 @@ class EvilEyeGame(tk.Tk):
 	def start_round(self):
 		if self.phase not in ("IDLE", "ROUND_OVER"):
 			return
+		self._start_stage(add_step=True)
+
+	def _start_stage(self, add_step):
+		if self.phase not in ("IDLE", "ROUND_OVER"):
+			return
 
 		self._cancel_jobs()
-		next_node = (random.randint(1, NUM_CHANNELS), random.choice(WALL_PATH))
-		self.sequence.append(next_node)
+		if add_step or not self.sequence:
+			next_node = (random.randint(1, NUM_CHANNELS), random.choice(WALL_PATH))
+			self.sequence.append(next_node)
 		self.input_index = 0
 		self.current_show_node = None
 		self.phase = "SHOW"
@@ -319,11 +402,36 @@ class EvilEyeGame(tk.Tk):
 		self._cancel_round_jobs()
 		self.phase = "ROUND_OVER"
 		self.phase_var.set("Phase: Round Over")
-		self.status_var.set("Success! Press Start Round for next level")
+		self.status_var.set("Success! Next round starts in 10s")
 		self.log("Round complete.")
 		for ch in range(1, NUM_CHANNELS + 1):
 			self._flash((ch, 0), (0, 255, 80), 1.0)
 		self._render_leds()
+		self._next_round_job = self.after(AUTO_NEXT_ROUND_MS, self._start_next_round_if_ready)
+
+	def _start_next_round_if_ready(self):
+		self._next_round_job = None
+		if self.phase == "ROUND_OVER":
+			self.start_round()
+
+	def _apply_red_move_penalty(self, channel, led):
+		self._cancel_round_jobs()
+		if len(self.sequence) > 1:
+			self.sequence.pop()
+		self.phase = "ROUND_OVER"
+		self.phase_var.set("Phase: Penalty")
+		self.round_var.set(f"Round: {len(self.sequence)}")
+		self.status_var.set(f"Moved on RED (W{channel} B{led}) -> back to round {len(self.sequence)}")
+		self.log(f"Red-light penalty at W{channel} B{led}. Regressed to round {len(self.sequence)}.")
+		for ch in range(1, NUM_CHANNELS + 1):
+			self._flash((ch, 0), (255, 0, 0), 0.9)
+		self._render_leds()
+		self._next_round_job = self.after(RED_PENALTY_RESTART_MS, self._restart_after_red_penalty)
+
+	def _restart_after_red_penalty(self):
+		self._next_round_job = None
+		if self.phase == "ROUND_OVER" and self.sequence:
+			self._start_stage(add_step=False)
 
 	def _cancel_round_jobs(self):
 		if self._show_job is not None:
@@ -341,6 +449,9 @@ class EvilEyeGame(tk.Tk):
 		if self._refresh_job is not None:
 			self.after_cancel(self._refresh_job)
 			self._refresh_job = None
+		if self._next_round_job is not None:
+			self.after_cancel(self._next_round_job)
+			self._next_round_job = None
 
 	def _flash(self, node, color, sec):
 		self._flash_leds[node] = (color, time.time() + sec)
@@ -406,7 +517,7 @@ class EvilEyeGame(tk.Tk):
 			return
 
 		if not self.green_light:
-			self._round_failed(f"Movement during RED (W{channel} B{led})")
+			self._apply_red_move_penalty(channel, led)
 			return
 
 		if led not in WALL_PATH:
@@ -460,4 +571,7 @@ class EvilEyeGame(tk.Tk):
 		self.destroy()
 
 if __name__ == "__main__":
-	EvilEyeGame().mainloop()
+	print("[Discovery] Scanning LAN for Evil Eye hardware...")
+	device_ip, send_port, recv_port = run_discovery()
+	print(f"[Discovery] Connecting to {device_ip}:{send_port} (recv:{recv_port})")
+	EvilEyeGame(device_ip, send_port, recv_port).mainloop()
