@@ -16,19 +16,27 @@ LEDS_PER_CHANNEL = 11
 SIMULATOR_IP = '127.0.0.1'
 SEND_PORT = 7277  # To simulator (light commands)
 RECV_PORT = 7278  # From simulator (button events)
-USE_REAL_ROOM = 1  # 0 = force simulator, 1 = allow real room discovery
+USE_REAL_ROOM = 0  # 0 = force simulator, 1 = allow real room discovery
 DEBUG_INPUT = 1  # 1 = print input/trigger debug logs
 FRAME_DATA_LEN = LEDS_PER_CHANNEL * NUM_CHANNELS * 3
 TRIGGER_PACKET_LEN = 687
 
 # Real hardware can have different channel/LED wiring than simulator.
 # These defaults reflect current in-room measurements.
-REAL_ROOM_COLOR_ORDER = "RGB"
+REAL_ROOM_COLOR_ORDER = "BRG"
 REAL_ROOM_SWAP_RB = 1      # Real room shows red as blue without this correction.
-REAL_ROOM_LED_SHIFT = 1    # Real room LEDs appear one index left; shift output +1.
+REAL_ROOM_LED_SHIFT = 1    # Real room LEDs map with +1 offset.
+REAL_ROOM_INPUT_LED_SHIFT = -1  # Inverse mapping for button packet indices.
+
+# Visual compatibility mode selector:
+# 1 = apply real-room mapping (use this to make simulator look exactly like real room)
+# 0 = pure simulator/default mapping
+COMPAT_REAL_ROOM_VIEW = 1
+
 OUTPUT_COLOR_ORDER = "RGB"
 OUTPUT_SWAP_RB = False
 OUTPUT_LED_SHIFT = 0
+INPUT_LED_SHIFT = 0
 
 # Real hardware ports (used when a device is discovered on the LAN)
 DEVICE_SEND_PORT = 4626    # Send light commands to device
@@ -56,7 +64,7 @@ EYE_SCAN_MIN_MS = 2000
 EYE_SCAN_MAX_MS = 4000
 EYE_SCAN_GAP_MIN_MS = 10000
 EYE_SCAN_GAP_MAX_MS = 15000
-EYE_SCAN_GRACE_MS = 500
+EYE_SCAN_GRACE_MS = 200
 PRE_SCAN_WARN_MS = 1000
 PRE_SCAN_BLINK_INTERVAL_MS = 180
 PRE_SCAN_RED_LEVEL = 128
@@ -69,6 +77,10 @@ SPIN_COOLDOWN_MAX_SEC = 2
 HOLD_TARGET_COLOR = (0, 0, 255)
 HOLD_SOURCE_LED = 10
 HOLD_ADJACENT_LED = 1
+LEFT_LANE_ORDER = (1, 2, 3, 4, 5)
+RIGHT_LANE_ORDER = (6, 7, 8, 9, 10)
+BASE_LEFT_TRIGGER_LED = LEFT_LANE_ORDER[len(LEFT_LANE_ORDER) // 2]
+BASE_RIGHT_TRIGGER_LED = RIGHT_LANE_ORDER[len(RIGHT_LANE_ORDER) // 2]
 ANIM_COLORS = (
 	(0, 255, 0),
 	(0, 255, 255),
@@ -199,10 +211,21 @@ def map_output_color(r, g, b):
 
 
 def map_output_led_index(led):
-	out_led = led
-	if OUTPUT_LED_SHIFT:
-		out_led = (led + OUTPUT_LED_SHIFT) % LEDS_PER_CHANNEL
-	return out_led
+	if not OUTPUT_LED_SHIFT or led == EYE_LED_INDEX:
+		return led
+	# Shift only within playable LEDs (1..10) to avoid colliding with eye index 0.
+	playable_span = LEDS_PER_CHANNEL - 1
+	base_idx = led - 1
+	return ((base_idx + OUTPUT_LED_SHIFT) % playable_span) + 1
+
+
+def map_input_led_index(led):
+	if not INPUT_LED_SHIFT or led == EYE_LED_INDEX:
+		return led
+	# Mirror output remap within playable LEDs (1..10), never remap into eye index 0.
+	playable_span = LEDS_PER_CHANNEL - 1
+	base_idx = led - 1
+	return ((base_idx + INPUT_LED_SHIFT) % playable_span) + 1
 
 
 def build_frame_data(led_states):
@@ -513,7 +536,7 @@ class GamblerFugitiveGame:
 			base = 2 + (ch - 1) * 171
 			for idx in range(LEDS_PER_CHANNEL):
 				if data[base + 1 + idx] == 0xCC:
-					pressed.add((ch, idx))
+					pressed.add((ch, map_input_led_index(idx)))
 
 		# Queue input for main-thread processing; do not call Tk APIs from recv thread.
 		with self._input_queue_lock:
@@ -760,6 +783,8 @@ class GamblerFugitiveGame:
 	def _apply_playing_baseline(self, now=None):
 		if now is None:
 			now = time.monotonic()
+		left_trigger_led = self._left_trigger_led()
+		right_trigger_led = self._right_trigger_led()
 		blocked_walls = set()
 		if self._is_caught_hold_active():
 			blocked_walls = self._get_caught_hold_walls()
@@ -782,16 +807,22 @@ class GamblerFugitiveGame:
 				or self._has_active_lane_animation(ch, "right")
 				or now < self._lane_cooldown_until.get((ch, "right"), 0.0)
 			)
-			if not left_blocked and 0 <= 3 < LEDS_PER_CHANNEL:
-				self.led_states[(ch, 3)] = (0, 255, 0)
-			if not right_blocked and 0 <= 8 < LEDS_PER_CHANNEL:
-				self.led_states[(ch, 8)] = (0, 255, 0)
+			if not left_blocked and 0 <= left_trigger_led < LEDS_PER_CHANNEL:
+				self.led_states[(ch, left_trigger_led)] = (0, 255, 0)
+			if not right_blocked and 0 <= right_trigger_led < LEDS_PER_CHANNEL:
+				self.led_states[(ch, right_trigger_led)] = (0, 255, 0)
 
 	def _has_active_lane_animation(self, channel, lane):
 		for _anim_id, anim in self.button_animations.items():
 			if anim.get("channel") == channel and anim.get("lane") == lane:
 				return True
 		return False
+
+	def _left_trigger_led(self):
+		return BASE_LEFT_TRIGGER_LED
+
+	def _right_trigger_led(self):
+		return BASE_RIGHT_TRIGGER_LED
 
 	def _get_adjacent_wall(self, channel):
 		return channel + 1 if channel < NUM_CHANNELS else 1
@@ -955,6 +986,8 @@ class GamblerFugitiveGame:
 
 	def _maybe_start_press_animations(self, pressed, now):
 		"""Start lane animations from trigger buttons, respecting state gates and latches."""
+		left_trigger_led = self._left_trigger_led()
+		right_trigger_led = self._right_trigger_led()
 		blocked_walls = set()
 		if self._is_caught_hold_active():
 			blocked_walls = self._get_caught_hold_walls()
@@ -968,11 +1001,11 @@ class GamblerFugitiveGame:
 				self._anim_press_latch.discard((ch, "right"))
 			return
 
-		# 3/8 presses are ignored while any eye warning/scan/blink is active.
+		# Trigger presses are ignored while any eye warning/scan/blink is active.
 		if self._is_eye_animation_active(now):
 			for ch in range(1, NUM_CHANNELS + 1):
-				left_pressed = ((ch, 3) in pressed) or ((ch, 2) in pressed)
-				right_pressed = ((ch, 8) in pressed) or ((ch, 7) in pressed)
+				left_pressed = (ch, left_trigger_led) in pressed
+				right_pressed = (ch, right_trigger_led) in pressed
 				left_key = (ch, "left")
 				right_key = (ch, "right")
 				if left_pressed:
@@ -990,8 +1023,8 @@ class GamblerFugitiveGame:
 				self._anim_press_latch.discard((ch, "left"))
 				self._anim_press_latch.discard((ch, "right"))
 				continue
-			left_pressed = ((ch, 3) in pressed) or ((ch, 2) in pressed)
-			right_pressed = ((ch, 8) in pressed) or ((ch, 7) in pressed)
+			left_pressed = (ch, left_trigger_led) in pressed
+			right_pressed = (ch, right_trigger_led) in pressed
 
 			left_key = (ch, "left")
 			right_key = (ch, "right")
@@ -1008,7 +1041,7 @@ class GamblerFugitiveGame:
 					print(f"[Anim] TRIGGER wall={ch} lane=left (1-5)")
 				self._anim_press_latch.add(left_key)
 				if now >= self._lane_cooldown_until.get(left_key, 0.0):
-					self._start_button_animation(ch, "left", [1, 2, 3, 4, 5])
+					self._start_button_animation(ch, "left", LEFT_LANE_ORDER)
 				elif DEBUG_INPUT:
 					print(f"[Anim] SKIP wall={ch} lane=left cooldown")
 
@@ -1017,7 +1050,7 @@ class GamblerFugitiveGame:
 					print(f"[Anim] TRIGGER wall={ch} lane=right (6-10)")
 				self._anim_press_latch.add(right_key)
 				if now >= self._lane_cooldown_until.get(right_key, 0.0):
-					self._start_button_animation(ch, "right", [6, 7, 8, 9, 10])
+					self._start_button_animation(ch, "right", RIGHT_LANE_ORDER)
 				elif DEBUG_INPUT:
 					print(f"[Anim] SKIP wall={ch} lane=right cooldown")
 
@@ -1148,19 +1181,20 @@ if __name__ == "__main__":
 	try:
 		print("[Discovery] Scanning LAN for Evil Eye hardware...")
 		device_ip, send_port, recv_port = run_discovery()
-		is_real_target = (send_port == DEVICE_SEND_PORT and recv_port == DEVICE_RECV_PORT)
-		OUTPUT_SWAP_RB = bool(is_real_target and REAL_ROOM_SWAP_RB)
-		OUTPUT_LED_SHIFT = REAL_ROOM_LED_SHIFT if is_real_target else 0
-		OUTPUT_COLOR_ORDER = REAL_ROOM_COLOR_ORDER if is_real_target else "RGB"
-		if is_real_target:
+		compat_real = bool(COMPAT_REAL_ROOM_VIEW)
+		OUTPUT_SWAP_RB = bool(compat_real and REAL_ROOM_SWAP_RB)
+		OUTPUT_LED_SHIFT = REAL_ROOM_LED_SHIFT if compat_real else 0
+		INPUT_LED_SHIFT = REAL_ROOM_INPUT_LED_SHIFT if compat_real else 0
+		OUTPUT_COLOR_ORDER = REAL_ROOM_COLOR_ORDER if compat_real else "RGB"
+		if compat_real:
 			print(
-				f"[Compat] Real-room mapping active: order={OUTPUT_COLOR_ORDER}, "
-				f"swap_rb={OUTPUT_SWAP_RB}, led_shift={OUTPUT_LED_SHIFT}"
+				f"[Compat] Real-room view mapping active: order={OUTPUT_COLOR_ORDER}, "
+				f"swap_rb={OUTPUT_SWAP_RB}, out_led_shift={OUTPUT_LED_SHIFT}, in_led_shift={INPUT_LED_SHIFT}"
 			)
 		else:
 			print(
 				f"[Compat] Simulator/default mapping active: order={OUTPUT_COLOR_ORDER}, "
-				f"swap_rb={OUTPUT_SWAP_RB}, led_shift={OUTPUT_LED_SHIFT}"
+				f"swap_rb={OUTPUT_SWAP_RB}, out_led_shift={OUTPUT_LED_SHIFT}, in_led_shift={INPUT_LED_SHIFT}"
 			)
 		print(f"[Discovery] Connecting to {device_ip}:{send_port} (recv:{recv_port})")
 		game = GamblerFugitiveGame(device_ip, send_port, recv_port)
