@@ -27,8 +27,8 @@ _CFG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tetris_con
 def _load_config():
     defaults = {
         "device_ip": "255.255.255.255",
-        "send_port": 9999,
-        "recv_port": 9998,
+        "send_port": 4626,
+        "recv_port": 7800,
         "bind_ip": "0.0.0.0",
         "bgm_path": "_sfx/bgm.wav"
     }
