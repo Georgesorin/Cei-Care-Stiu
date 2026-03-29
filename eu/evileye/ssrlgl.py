@@ -8,6 +8,7 @@ from tkinter import ttk
 # --- Protocol/Simulator Settings ---
 NUM_CHANNELS = 4
 LEDS_PER_CHANNEL = 11
+EYE_LED_INDEX = 10
 SIMULATOR_IP = '127.0.0.1'
 SEND_PORT = 4626  # To simulator (light commands)
 RECV_PORT = 7800  # From simulator (button events)
@@ -20,8 +21,8 @@ DEVICE_SEND_PORT = 4626    # Send light commands to device
 DEVICE_RECV_PORT = 7800    # Receive button events from device
 DISCOVERY_TIMEOUT_SEC = 3  # How long to wait for a hardware response
 
-# Playable buttons based on your wall layout.
-WALL_PATH = list(range(1, 11))
+# Playable buttons based on your wall layout (all non-eye LEDs).
+WALL_PATH = [idx for idx in range(LEDS_PER_CHANNEL) if idx != EYE_LED_INDEX]
 
 # Timings (milliseconds)
 SHOW_ON_MS = 700
@@ -308,6 +309,9 @@ class EvilEyeGame(tk.Tk):
 		self.log_text = tk.Text(self, height=20, state="disabled", bg="#111", fg="#00ff8c")
 		self.log_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
 
+	def _btn_label(self, led):
+		return led + 1
+
 	def log(self, msg):
 		self.log_text.configure(state="normal")
 		self.log_text.insert(tk.END, msg + "\n")
@@ -439,7 +443,7 @@ class EvilEyeGame(tk.Tk):
 			self.status_var.set("First fail on round 1 — extra chance! Retrying in 3s...")
 			self.log(f"Grace on round 1: {reason}. Retrying...")
 			for ch in range(1, NUM_CHANNELS + 1):
-				self._flash((ch, 0), (255, 165, 0), 1.5)
+				self._flash((ch, EYE_LED_INDEX), (255, 165, 0), 1.5)
 			self._render_leds()
 			self._next_round_job = self.after(3000, self._use_grace_retry)
 			return
@@ -449,7 +453,7 @@ class EvilEyeGame(tk.Tk):
 		self.status_var.set(f"Failed: {reason}")
 		self.log(f"Round failed: {reason}")
 		for ch in range(1, NUM_CHANNELS + 1):
-			self._flash((ch, 0), (255, 0, 0), 0.8)
+			self._flash((ch, EYE_LED_INDEX), (255, 0, 0), 0.8)
 		self._render_leds()
 
 	def _round_success(self):
@@ -459,7 +463,7 @@ class EvilEyeGame(tk.Tk):
 		self.status_var.set("Success! Next round starts in 10s")
 		self.log("Round complete.")
 		for ch in range(1, NUM_CHANNELS + 1):
-			self._flash((ch, 0), (0, 255, 80), 1.0)
+			self._flash((ch, EYE_LED_INDEX), (0, 255, 80), 1.0)
 		self._render_leds()
 		self._next_round_job = self.after(AUTO_NEXT_ROUND_MS, self._start_next_round_if_ready)
 
@@ -481,10 +485,10 @@ class EvilEyeGame(tk.Tk):
 		self.phase = "ROUND_OVER"
 		self.phase_var.set("Phase: Penalty")
 		self.round_var.set(f"Round: {len(self.sequence)}")
-		self.status_var.set(f"Moved on RED (W{channel} B{led}) -> back to round {len(self.sequence)}")
-		self.log(f"Red-light penalty at W{channel} B{led}. Regressed to round {len(self.sequence)}.")
+		self.status_var.set(f"Moved on RED (W{channel} B{self._btn_label(led)}) -> back to round {len(self.sequence)}")
+		self.log(f"Red-light penalty at W{channel} B{self._btn_label(led)}. Regressed to round {len(self.sequence)}.")
 		for ch in range(1, NUM_CHANNELS + 1):
-			self._flash((ch, 0), (255, 0, 0), 0.9)
+			self._flash((ch, EYE_LED_INDEX), (255, 0, 0), 0.9)
 		self._render_leds()
 		self._next_round_job = self.after(RED_PENALTY_RESTART_MS, self._restart_after_red_penalty)
 
@@ -509,7 +513,7 @@ class EvilEyeGame(tk.Tk):
 		self.status_var.set("GAME OVER — Press Reset to play again")
 		self.log("GAME OVER! Returned to round 1 too many times.")
 		for ch in range(1, NUM_CHANNELS + 1):
-			self._flash((ch, 0), (255, 0, 0), 10.0)
+			self._flash((ch, EYE_LED_INDEX), (255, 0, 0), 10.0)
 		self._render_leds()
 
 	def _cancel_round_jobs(self):
@@ -572,7 +576,7 @@ class EvilEyeGame(tk.Tk):
 		leds = {}
 		eye_rgb = self._eye_color()
 		for ch in range(1, NUM_CHANNELS + 1):
-			leds[(ch, 0)] = eye_rgb
+			leds[(ch, EYE_LED_INDEX)] = eye_rgb
 
 		if self.phase == "SHOW" and self.current_show_node:
 			leds[self.current_show_node] = (0, 210, 255)
@@ -591,7 +595,7 @@ class EvilEyeGame(tk.Tk):
 	def _apply_motion_penalty(self, channel):
 		self.eye_strikes += 1
 		self.input_deadline_ts = max(time.time() + 1.0, self.input_deadline_ts - EYE_PENALTY_SECONDS)
-		self._flash((channel, 0), (255, 80, 80), 0.7)
+		self._flash((channel, EYE_LED_INDEX), (255, 80, 80), 0.7)
 		remaining = max(0.0, self.input_deadline_ts - time.time())
 		self.log(
 			f"Motion detected on eye W{channel}. Penalty {self.eye_strikes}/{MAX_EYE_STRIKES}, "
@@ -614,7 +618,7 @@ class EvilEyeGame(tk.Tk):
 		if (now - self._last_press_ts) < (DETECTION_COOLDOWN_MS / 1000.0):
 			return
 
-		if led == 0:
+		if led == EYE_LED_INDEX:
 			if (now - self._last_motion_ts) < (MOTION_COOLDOWN_MS / 1000.0):
 				return
 			self._last_motion_ts = now
@@ -624,7 +628,7 @@ class EvilEyeGame(tk.Tk):
 
 		if not self.green_light:
 			if (now - self._last_light_toggle_ts) < (RED_LIGHT_GRACE_MS / 1000.0):
-				self.log(f"Ignored W{channel} B{led} during red-light grace window")
+				self.log(f"Ignored W{channel} B{self._btn_label(led)} during red-light grace window")
 				return
 			if not self.red_warning_used:
 				self.red_warning_used = True
@@ -633,11 +637,11 @@ class EvilEyeGame(tk.Tk):
 				self.status_var.set(
 					f"Warning: moved on RED once (next red move penalizes) | Motion strikes: {self.eye_strikes}/{MAX_EYE_STRIKES}"
 				)
-				self.log(f"Warning only: RED movement at W{channel} B{led}")
+				self.log(f"Warning only: RED movement at W{channel} B{self._btn_label(led)}")
 				self._render_leds()
 				return
 			if (now - self._last_red_penalty_ts) < (RED_MOVE_COOLDOWN_MS / 1000.0):
-				self.log(f"Ignored repeated RED movement at W{channel} B{led} (cooldown)")
+				self.log(f"Ignored repeated RED movement at W{channel} B{self._btn_label(led)} (cooldown)")
 				return
 			self._last_red_penalty_ts = now
 			self._last_press_ts = now
@@ -653,12 +657,14 @@ class EvilEyeGame(tk.Tk):
 			self._last_press_ts = now
 			self._flash((channel, led), (255, 0, 0), 0.6)
 			self._render_leds()
-			self._round_failed(f"Wrong button. Expected W{expected[0]} B{expected[1]}")
+			self._round_failed(
+				f"Wrong button. Expected W{expected[0]} B{self._btn_label(expected[1])}"
+			)
 			return
 
 		self._last_press_ts = now
 		self._flash((channel, led), (0, 255, 120), 0.5)
-		self.log(f"Correct: W{channel} B{led}")
+		self.log(f"Correct: W{channel} B{self._btn_label(led)}")
 		self.input_index += 1
 
 		if self.input_index >= len(self.sequence):
@@ -687,15 +693,15 @@ class EvilEyeGame(tk.Tk):
 
 		now = time.time()
 
-		# Motion (LED index 0): packet-based trigger with active-state gating.
+		# Motion (eye LED index): packet-based trigger with active-state gating.
 		for ch in range(1, NUM_CHANNELS + 1):
-			node = (ch, 0)
+			node = (ch, EYE_LED_INDEX)
 			if node in pressed:
 				self._motion_last_seen_ts[ch] = now
 				self._motion_seen_count[ch] = self._motion_seen_count.get(ch, 0) + 1
 				if ch not in self._motion_reported_active and self._motion_seen_count[ch] >= MOTION_CONFIRM_PACKETS:
 					self._motion_reported_active.add(ch)
-					self._handle_rising_press(ch, 0)
+					self._handle_rising_press(ch, EYE_LED_INDEX)
 			else:
 				last_seen = self._motion_last_seen_ts.get(ch, 0.0)
 				if (now - last_seen) >= (MOTION_ACTIVE_GAP_MS / 1000.0):
