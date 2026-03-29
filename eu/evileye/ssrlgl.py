@@ -24,12 +24,9 @@ FRAME_DATA_LEN = LEDS_PER_CHANNEL * NUM_CHANNELS * 3
 TRIGGER_PACKET_LEN = 687
 
 # Real hardware ports (used when a device is discovered on the LAN)
-# DEVICE_IP = '169.254.182.11'  Known device IP (link-local)
-DEVICE_IP = '127.0.0.1'
-# DEVICE_SEND_PORT = 4626    # Send light commands to device
-# DEVICE_RECV_PORT = 7800    # Receive button events from device
-DEVICE_SEND_PORT = 7273
-DEVICE_RECV_PORT = 7272
+DEVICE_IP = '169.254.182.11'       # Known device IP (link-local)
+DEVICE_SEND_PORT = 4626            # Send light commands to device
+DEVICE_RECV_PORT = 7800            # Receive button events from device
 DISCOVERY_TIMEOUT_SEC = 3  # How long to wait for a hardware response
 
 # Playable buttons based on your wall layout (all non-eye LEDs).
@@ -301,8 +298,12 @@ class EvilEyeGame(tk.Tk):
 		self.title("Evil Eye - Memory x Red Light / Green Light")
 		self.geometry("860x520")
 
+		self._device_ip = device_ip
+		self._send_port = send_port
+		self._recv_port = recv_port
+		self._is_simulator = (device_ip == SIMULATOR_IP)
 		self.comm = EvilEyeComm(self.on_button_event, device_ip, send_port, recv_port)
-		self._device_label = f"{device_ip}:{send_port}"
+		self._device_label_var = tk.StringVar(value=f"Device: {device_ip}:{send_port}")
 		self.status_var = tk.StringVar(value="Press Start Round")
 		self.round_var = tk.StringVar(value="Round: 0")
 		self.phase_var = tk.StringVar(value="Phase: Idle")
@@ -481,7 +482,9 @@ class EvilEyeGame(tk.Tk):
 		tk.Label(top, textvariable=self.round_var, bg="#1f1f1f", fg="#d8d8d8").pack(side=tk.LEFT, padx=14)
 		tk.Label(top, textvariable=self.phase_var).pack(side=tk.LEFT, padx=14)
 		tk.Label(top, textvariable=self.status_var).pack(side=tk.LEFT, padx=14)
-		tk.Label(top, text=f"Device: {self._device_label}", bg="#1f1f1f", fg="#888").pack(side=tk.RIGHT, padx=10)
+		tk.Label(top, textvariable=self._device_label_var, bg="#1f1f1f", fg="#888").pack(side=tk.RIGHT, padx=10)
+		self._mode_btn = ttk.Button(top, text=self._mode_btn_text(), command=self._switch_connection)
+		self._mode_btn.pack(side=tk.RIGHT, padx=6, pady=10)
 
 		self.log_text = tk.Text(self, height=20, state="disabled", bg="#111", fg="#00ff8c")
 		self.log_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
@@ -551,6 +554,33 @@ class EvilEyeGame(tk.Tk):
 
 	def _btn_label(self, led):
 		return led + 1
+
+	def _mode_btn_text(self):
+		return "Switch to Live" if self._is_simulator else "Switch to Simulator"
+
+	def _switch_connection(self):
+		if self._is_simulator:
+			self._mode_btn.configure(text="Connecting...", state="disabled")
+			threading.Thread(target=self._connect_live, daemon=True).start()
+		else:
+			self._apply_connection(SIMULATOR_IP, SEND_PORT, RECV_PORT, is_simulator=True)
+
+	def _connect_live(self):
+		device_ip, send_port, recv_port = run_discovery()
+		self.after(0, lambda: self._apply_connection(device_ip, send_port, recv_port, is_simulator=(device_ip == SIMULATOR_IP)))
+
+	def _apply_connection(self, device_ip, send_port, recv_port, is_simulator):
+		self.comm.close()
+		time.sleep(0.1)  # Allow old recv thread to exit
+		self._device_ip = device_ip
+		self._send_port = send_port
+		self._recv_port = recv_port
+		self._is_simulator = is_simulator
+		self.comm = EvilEyeComm(self.on_button_event, device_ip, send_port, recv_port)
+		self._device_label_var.set(f"Device: {device_ip}:{send_port}")
+		self._mode_btn.configure(text=self._mode_btn_text(), state="normal")
+		mode = "simulator" if is_simulator else "live"
+		self.log(f"Switched to {mode}: {device_ip}:{send_port}")
 
 	def log(self, msg):
 		self.log_text.configure(state="normal")
