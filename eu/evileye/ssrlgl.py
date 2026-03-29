@@ -41,6 +41,7 @@ INPUT_GREEN_MS = 3400
 INPUT_RED_MS = 1400
 INPUT_TIMEOUT_MS = 20000
 LED_REFRESH_MS = 220
+START_ROUND_DELAY_MS = 3000
 EYE_PENALTY_SECONDS = 1.0
 MAX_EYE_STRIKES = 4
 AUTO_NEXT_ROUND_MS = 5000
@@ -344,6 +345,7 @@ class EvilEyeGame(tk.Tk):
 		self._timeout_job = None
 		self._refresh_job = None
 		self._next_round_job = None
+		self._start_round_job = None
 		self._tv_window = None
 		self._tv_text_var = tk.StringVar(value="Welcome. Press Start Round.")
 		self._sound_gain = 0.8
@@ -633,10 +635,22 @@ class EvilEyeGame(tk.Tk):
 		self.log("Game reset.")
 		self._render_leds()
 
-	def start_round(self):
+	def start_round(self, delayed=True):
 		if self.phase not in ("IDLE", "ROUND_OVER"):
 			return
+		if delayed:
+			if self._start_round_job is not None:
+				return
+			self.status_var.set("Starting round in 3s...")
+			self.log("Round start requested. Starting in 3s.")
+			self._start_round_job = self.after(START_ROUND_DELAY_MS, self._begin_delayed_round)
+			return
 		self._start_stage(add_step=True)
+
+	def _begin_delayed_round(self):
+		self._start_round_job = None
+		if self.phase in ("IDLE", "ROUND_OVER"):
+			self._start_stage(add_step=True)
 
 	def _button_grid_pos(self, led):
 		button_idx = max(0, led - 1)
@@ -791,7 +805,7 @@ class EvilEyeGame(tk.Tk):
 	def _start_next_round_if_ready(self):
 		self._next_round_job = None
 		if self.phase == "ROUND_OVER":
-			self.start_round()
+			self.start_round(delayed=False)
 
 	def _apply_red_move_penalty(self, channel, led):
 		self._cancel_round_jobs()
@@ -856,6 +870,9 @@ class EvilEyeGame(tk.Tk):
 		if self._next_round_job is not None:
 			self.after_cancel(self._next_round_job)
 			self._next_round_job = None
+		if self._start_round_job is not None:
+			self.after_cancel(self._start_round_job)
+			self._start_round_job = None
 
 	# --- Difficulty scaling ---
 	def _get_show_on_ms(self):
@@ -907,8 +924,8 @@ class EvilEyeGame(tk.Tk):
 		self.comm.send_led_frame(self._last_led_states)
 
 	def _schedule_led_refresh(self):
-		if self._last_led_states:
-			self.comm.send_led_frame(self._last_led_states)
+		# Re-render on each tick so expired flashes are actively cleared.
+		self._render_leds()
 		self._refresh_job = self.after(LED_REFRESH_MS, self._schedule_led_refresh)
 
 	def _apply_motion_penalty(self, channel):
