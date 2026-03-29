@@ -13,14 +13,14 @@ _CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eye_sim
 
 def _load_config():
     defaults = {
-        "send_port": 9998,
-        "recv_port": 9999,
+        "send_port": 7273,
+        "recv_port": 7274,
         "device_ip": "255.255.255.255",
         "last_used_ports": []
     }
     try:
-        if os.path.exists(_CFG_FILE):
-            with open(_CFG_FILE, encoding="utf-8") as f:
+        if os.path.exists(_CONFIG_FILE):
+            with open(_CONFIG_FILE, encoding="utf-8") as f:
                 data = json.load(f)
                 defaults.update(data)
         return defaults
@@ -29,7 +29,7 @@ def _load_config():
 
 def _save_config(config):
     try:
-        with open(_CFG_FILE, 'w', encoding="utf-8") as f:
+        with open(_CONFIG_FILE, 'w', encoding="utf-8") as f:
             json.dump(config, f, indent=4)
     except:
         pass
@@ -192,12 +192,16 @@ class EvilEyeSimulator:
 
         tk.Label(bar, text="Port IN:", bg="#2a2a2a", fg="#888", font=("Consolas", 8)).pack(side=tk.LEFT, padx=(10, 2))
         self.port_in_var = tk.StringVar(value=str(self.listen_port))
-        tk.Entry(bar, textvariable=self.port_in_var, width=6, bg="#111", fg="#0f0", font=("Consolas", 9)).pack(side=tk.LEFT, padx=2)
+        _e_in = tk.Entry(bar, textvariable=self.port_in_var, width=6, bg="#111", fg="#0f0", font=("Consolas", 9))
+        _e_in.pack(side=tk.LEFT, padx=2)
+        _e_in.bind("<Return>", self.apply_ports)
         tk.Button(bar, text="🎲", command=self.randomize_port, bg="#444", fg="white", font=("Consolas", 8), relief="flat").pack(side=tk.LEFT, padx=2)
 
         tk.Label(bar, text="Port OUT:", bg="#2a2a2a", fg="#888", font=("Consolas", 8)).pack(side=tk.LEFT, padx=(10, 2))
         self.port_out_var = tk.StringVar(value=str(self.send_port))
-        tk.Entry(bar, textvariable=self.port_out_var, width=6, bg="#111", fg="#0f0", font=("Consolas", 9)).pack(side=tk.LEFT, padx=2)
+        _e_out = tk.Entry(bar, textvariable=self.port_out_var, width=6, bg="#111", fg="#0f0", font=("Consolas", 9))
+        _e_out.pack(side=tk.LEFT, padx=2)
+        _e_out.bind("<Return>", self.apply_ports)
 
         tk.Label(bar, text="F11: Fullscreen | ESC: Exit", bg="#2a2a2a", fg="#777", font=("Consolas", 8)).pack(side=tk.RIGHT, padx=10)
 
