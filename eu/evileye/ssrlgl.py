@@ -15,6 +15,7 @@ FRAME_DATA_LEN = LEDS_PER_CHANNEL * NUM_CHANNELS * 3
 TRIGGER_PACKET_LEN = 687
 
 # Real hardware ports (used when a device is discovered on the LAN)
+DEVICE_IP = '169.254.182.11'  # Known device IP (link-local)
 DEVICE_SEND_PORT = 4626    # Send light commands to device
 DEVICE_RECV_PORT = 7800    # Receive button events from device
 DISCOVERY_TIMEOUT_SEC = 3  # How long to wait for a hardware response
@@ -172,6 +173,8 @@ def run_discovery():
 	try:
 		sock.sendto(pkt, ('255.255.255.255', DEVICE_SEND_PORT))
 		print(f"[Discovery] Sent broadcast to 255.255.255.255:{DEVICE_SEND_PORT}")
+		sock.sendto(pkt, (DEVICE_IP, DEVICE_SEND_PORT))
+		print(f"[Discovery] Sent unicast to {DEVICE_IP}:{DEVICE_SEND_PORT}")
 	except OSError as e:
 		sock.close()
 		print(f"[Discovery] Broadcast failed: {e} — using simulator fallback.")
@@ -196,8 +199,8 @@ def run_discovery():
 
 	if found_ip:
 		return found_ip, DEVICE_SEND_PORT, DEVICE_RECV_PORT
-	print("[Discovery] No hardware found — using simulator fallback.")
-	return SIMULATOR_IP, SEND_PORT, RECV_PORT
+	print("[Discovery] No hardware found — falling back to known device IP.")
+	return DEVICE_IP, DEVICE_SEND_PORT, DEVICE_RECV_PORT
 
 
 # --- UDP Communication ---
