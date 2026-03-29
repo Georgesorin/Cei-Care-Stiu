@@ -32,9 +32,9 @@ FLASH_DURATION  =  1.0   # end-of-round flash
 # Set to None to auto-detect from eye_ctrl_config.json; set a number to override.
 # Simulator default:  Port IN (light commands) = 9999,  Port OUT (button events) = 9998
 # Real hardware:      Port IN (light commands) = 9998,  Port OUT (button events) = 9999
-DEVICE_IP   = None   # e.g. "192.168.1.7" or "255.255.255.255"
-SEND_PORT   = None   # port the Simulator/device listens on  (matches Simulator "Port IN")
-RECV_PORT   = None   # port we listen on for button events   (matches Simulator "Port OUT")
+DEVICE_IP   = "169.254.182.11"   # e.g. "192.168.1.7" or "255.255.255.255"
+SEND_PORT   = 4626   # port the Simulator/device listens on  (matches Simulator "Port IN")
+RECV_PORT   = 7800   # port we listen on for button events   (matches Simulator "Port OUT")
 IFACE_INDEX = 1      # auto-select this interface index for discovery (None = ask at startup)
 
 # ── Config loading ────────────────────────────────────────────────────────────
@@ -45,8 +45,8 @@ def _load_config():
     # eye_ctrl_config.json naming (from hardware perspective):
     #   "udp_port"       = port where hardware SENDS button events  → we LISTEN here
     #   "receiver_port"  = port where hardware RECEIVES light data  → we SEND here
-    defaults = {"device_ip": "255.255.255.255", "udp_port": 9998,
-                "receiver_port": 9999, "polling_rate_ms": 100}
+    defaults = {"device_ip": "169.254.182.11", "udp_port": 4626,
+                "receiver_port": 7800, "polling_rate_ms": 100}
     try:
         with open(_CFG_PATH, encoding="utf-8") as f:
             defaults.update(json.load(f))
